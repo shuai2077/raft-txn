@@ -262,17 +262,73 @@ the lease — never correctness, and never permanent unavailability. The
 alternative (a membership-based liveness service) would be a second consensus
 system to reason about.
 
-### 7.4 Not serializable, deliberately
+### 7.4 Visibility is strict, and the read and conflict rules must be complements
+
+Visibility is `CommitTS < snapshot`; conflict detection is `CommitTS >= snapshot`.
+The two **must** be exact complements. This is not a style choice.
+
+The original implementation used `<=` and `>`. Those two rules disagree in a
+one-timestamp-wide band: a version committed at exactly the snapshot timestamp is
+visible to reads yet does **not** block writes. A transaction can therefore read a
+value, be raced by a concurrent writer committing at that same timestamp, and then
+overwrite a commit it had already observed — the classic lost update, with both
+transactions reporting success.
+
+`TestStoreNoLostUpdateAtTheSnapshotBoundary` pins this down directly.
+
+Strict visibility has two consequences worth stating, because they are confusing
+otherwise:
+
+* **Does a transaction need a read-back to see its own write?** No. Its own writes
+  are buffered locally and `Txn.Get` consults the buffer first.
+* **Not seeing a value at the boundary is correct.** A commit at ts `C` is
+  invisible at snapshot `C` and visible at `C+1`. Assertions of the form "visible
+  immediately after commit" must therefore read at `C+1`.
+
+### 7.5 Known open issue: cross-key snapshot reads
+
+**This is an open problem, recorded rather than hidden.**
+
+A read-only transaction reads each key through its own Raft round trip, all at one
+read timestamp. But a read timestamp does not by itself guarantee that every
+transaction committed below it has already become *visible* in every group:
+
+```
+T1 reads A and B at snapshot S
+T2 commits at c2 < S, but c2's entry has committed in A's group
+   and not yet in B's group
+=> T1 sees A's new value and B's old value: an inconsistent snapshot
+```
+
+The standard fix is a **read barrier**: after acquiring a candidate read
+timestamp, wait until every group has applied up to it before serving reads (or
+fall back to `ReadIndex`). This repository **does not implement that yet**.
+
+`TestConcurrentTransfersPreserveInvariant` can therefore observe a total of 199 or
+201 while transfers are still landing, even though every individual transfer is
+correct. The test waits for the cluster to settle before auditing, which narrows
+that window. Attributing its intermittent failures to this window is **plausible
+but not proven** — I did not run it to ground, so it is recorded here as open
+rather than presented as explained.
+
+One methodology lesson from that investigation is worth recording, because it cost
+most of the time: self-checks of the form "commit succeeded, so read the value back
+and compare it to what was written" are **not sound**. Concurrent transactions
+write the same values, leadership moves, and followers lag. Correlating a *value*
+with a *transaction* does not work. The only reliable statement is "all replicas
+agree about the same log", which is what `Cluster.WaitForSettled` checks.
+
+### 7.6 Not serializable, deliberately
 
 Snapshot isolation permits write skew: two transactions reading overlapping sets
 and writing disjoint keys can both commit, producing a state no serial order
-explains. Preventing it needs either read locks (which reintroduce deadlock, and
-so need deadlock detection) or a serializable validation phase. That is a real
-piece of work, it is separable (it would add a read-set check to `prewrite`), and
+explains. Preventing it needs either read locks (which reintroduce deadlock, and so
+need deadlock detection) or a serializable validation phase. That is a real piece
+of work, it is separable (it would add a read-set check to `prewrite`), and
 pretending to have it by labelling SI as serializable would be worse than not
 having it.
 
-### 7.5 The single-group fast path
+### 7.7 The single-group fast path
 
 When every key of a transaction lives in one group, `CmdPrewrite` can commit the
 writes in the *same* log entry that creates the locks (`OneShot`). That is sound

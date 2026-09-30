@@ -153,6 +153,70 @@ func (c *Cluster) WaitForRead(key txn.Key, timeout time.Duration) (txn.Value, bo
 	}
 }
 
+// WaitForSettled blocks until every live replica of every group has no intent
+// locks and all replicas of a group agree on the key sets and version counts.
+//
+// It answers the question "has everything in flight finished, and does the
+// cluster agree?" without any assumption about timing. Tests that assert an
+// invariant over several keys need it, because a read-only transaction's snapshot
+// does not by itself guarantee that every transaction committed below it has
+// become visible everywhere yet (see docs/02-transaction-design.md).
+func (c *Cluster) WaitForSettled(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if err := c.settled(); err != nil {
+			lastErr = err
+		} else {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cluster did not settle within %s: %w", timeout, lastErr)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func (c *Cluster) settled() error {
+	for g := 0; g < c.cfg.NumGroups; g++ {
+		// The reference is the first live replica of the group.
+		var refKeys []txn.Key
+		var refCounts []int
+		for n := 0; n < c.cfg.NodesPerGroup; n++ {
+			if !c.alive[g][n] || !c.connected[g][n] {
+				continue
+			}
+			store := c.GroupNode(g, n).Store()
+			if store == nil {
+				continue
+			}
+			if locks := store.Locks(); len(locks) != 0 {
+				return fmt.Errorf("group %d node %d still holds %d intent locks", g, n, len(locks))
+			}
+			keys := store.Keys()
+			counts := make([]int, len(keys))
+			for i, key := range keys {
+				counts[i] = len(store.VersionsFor(key))
+			}
+			if refKeys == nil {
+				refKeys, refCounts = keys, counts
+				continue
+			}
+			if len(keys) != len(refKeys) {
+				return fmt.Errorf("group %d: replicas disagree on the key set (%d vs %d keys)",
+					g, len(keys), len(refKeys))
+			}
+			for i := range keys {
+				if keys[i] != refKeys[i] || counts[i] != refCounts[i] {
+					return fmt.Errorf("group %d: node %d has key %q with %d versions; reference has %q with %d",
+						g, n, keys[i], counts[i], refKeys[i], refCounts[i])
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // SetRaftLogging turns the verbose Raft logging of every member on or off.
 //
 // The underlying switch is process-global, so this affects the whole cluster at

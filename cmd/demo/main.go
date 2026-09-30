@@ -187,6 +187,30 @@ func main() {
 	primary := cluster.GuessPrimaryKey(orphan.Writes())
 	fmt.Printf("intent locks are in place; the primary key is %q\n", primary)
 
+	// The claim this section makes at the end is "the reader finished the
+	// coordinator's work". That is only meaningful if the pending write really is
+	// not visible yet, so check it rather than assert it in prose.
+	//
+	// Note what to look for: bob *is* readable at this point - his last committed
+	// value, 130, is still there. What must not be there is 999, because the
+	// prepared write has not been published. Reading the shard's state machine
+	// directly bypasses the transaction layer, so this is the raw truth about
+	// what that shard holds.
+	secondaryShard := partitioner.GroupForKey("bob")
+	if secondaryShard == 0 {
+		log.Fatal("the demo expects bob to live in a different shard from alice")
+	}
+	secondaryStore := c.GroupNode(int(secondaryShard), c.LeaderOf(int(secondaryShard))).Store()
+	beforeSeal, _ := secondaryStore.ValueAtNow("bob")
+	if beforeSeal == "999" {
+		log.Fatal("the prepared write is already visible; the prewrite published it")
+	}
+	if _, locked := secondaryStore.Locks()["bob"]; !locked {
+		log.Fatal("bob has no intent lock; the transaction was not actually prepared")
+	}
+	fmt.Printf("checking the shard's state machine directly: bob = %q with an intent lock held,\n", beforeSeal)
+	fmt.Println("so the prepared write of 999 is not visible yet")
+
 	leaderOfShard := c.LeaderOf(0)
 	if leaderOfShard < 0 {
 		log.Fatal("shard 0 has no leader")

@@ -407,6 +407,67 @@ func (t *Txn) Commit(ctx context.Context) (Timestamp, error) {
 	return commitTS, nil
 }
 
+// Finish re-drives the finalization of a transaction that Commit reported as
+// *possibly* incomplete (a *CommitUnknownError).
+//
+// This distinction matters more than it looks. Once the primary lock is sealed
+// the transaction is committed for good, so it must not be rolled back - but its
+// remaining writes may still be sitting in other groups as intents that nobody
+// has published. A client that treats that as success may observe a partially
+// applied transaction: exactly the atomicity violation the whole design exists to
+// prevent.
+//
+// Finish publishes whatever is still pending, using the commit timestamp recorded
+// at the commit point. It is idempotent: keys whose writes already landed are
+// skipped, so calling it repeatedly (or from several clients) is safe.
+//
+// It returns nil once every group the transaction touched has published its
+// writes. A non-nil error means some group is still unreachable or still holds an
+// unexpired lock; the correct response is to retry, not to abandon the
+// transaction, because the commit already happened.
+func (t *Txn) Finish(ctx context.Context) error {
+	if t.state != stateCommitted || t.committedTS == 0 {
+		return fmt.Errorf("txn: transaction %d is %s; nothing to finish", t.id, t.state)
+	}
+
+	var firstErr error
+	for group := range t.prepared {
+		participant, err := t.c.participant(group)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		keys := make([]Key, 0, len(t.writes))
+		for key := range t.writes {
+			if t.c.partitioner.GroupForKey(key) == group {
+				keys = append(keys, key)
+			}
+		}
+		if len(keys) == 0 {
+			continue
+		}
+		sortKeys(keys)
+
+		// An empty CommitTS asks the group to use the timestamp its own lock
+		// records - which the coordinator sealed at the commit point. That makes
+		// this call work even if this particular Txn handle never learned the
+		// timestamp.
+		if err := participant.Commit(ctx, CommitRequest{
+			TxnID:     t.id,
+			ClientID:  t.c.clientID,
+			RequestID: t.c.nextRequestID(),
+			StartTS:   t.startTS,
+			CommitTS:  t.committedTS,
+			Keys:      keys,
+		}); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // Abort rolls the transaction back, releasing any locks it took.
 func (t *Txn) Abort(ctx context.Context) error {
 	if t.state == stateCommitted {

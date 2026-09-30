@@ -332,7 +332,15 @@ func TestSecondaryLockOfCommittedTransactionIsFinished(t *testing.T) {
 	}
 	// Seal the primary, which is the transaction's commit point, and then stop:
 	// the secondary group is left holding an unsealed intent.
-	cts := tc.oracle.last + 1
+	//
+	// Take the commit timestamp from the transaction's own oracle rather than
+	// inventing one, so the oracle's clock actually advances past it - otherwise a
+	// reader started afterwards could be handed the same timestamp, and the strict
+	// visibility rule would (correctly) hide the write from it.
+	cts, err := tc.oracle.CommitTS(context.Background(), tx.startTS)
+	if err != nil {
+		t.Fatalf("obtaining a commit timestamp: %v", err)
+	}
 	if err := tc.groups[0].Seal(context.Background(), "0a", tx.id, tx.startTS, cts); err != nil {
 		t.Fatalf("seal primary: %v", err)
 	}
@@ -345,7 +353,16 @@ func TestSecondaryLockOfCommittedTransactionIsFinished(t *testing.T) {
 
 	// A reader that trips over the secondary lock must finish the write, not
 	// discard it.
+	//
+	// The reader starts *after* the seal on purpose. Visibility is strict, so a
+	// snapshot taken below the commit timestamp would legitimately not see the
+	// recovered write - which is correct behaviour, and not what this test is
+	// about. Recovery must be observable, so the reader's snapshot is above the
+	// commit point.
 	reader := tc.Begin()
+	if reader.StartTS() <= cts {
+		t.Fatalf("reader snapshot %d is not above the commit timestamp %d", reader.StartTS(), cts)
+	}
 	v, found, err := reader.Get(context.Background(), "1b")
 	if err != nil {
 		t.Fatalf("read of the secondary key: %v", err)
@@ -464,7 +481,9 @@ func TestDeleteThenReadAcrossTransactions(t *testing.T) {
 	if versions[1].Kind != OpDelete {
 		t.Errorf("second version kind=%s, want delete", versions[1].Kind)
 	}
-	historical, foundHistorical := tc.Group(0).latestVersionAt("0a", versions[0].CommitTS)
+	// A historical read just above the first version's commit timestamp sees it;
+	// visibility is strict, so reading *at* that timestamp would be too early.
+	historical, foundHistorical := tc.Group(0).latestVersionAt("0a", versions[0].CommitTS+1)
 	if !foundHistorical || historical.Value != "alive" {
 		t.Errorf("historical read: got (%q, %v), want alive", historical.Value, foundHistorical)
 	}

@@ -265,11 +265,21 @@ func (s *Store) lockedResult(key Key, lock *LockRecord) TxnResult {
 }
 
 // latestVersionAt returns the value visible to the snapshot startTS.
+//
+// Visibility is strict: a version is visible only if its commit timestamp is
+// *below* the snapshot. That is not a detail. Reading at `CommitTS <= startTS`
+// would let a snapshot see a version committed at exactly its own timestamp,
+// while write-conflict detection - which must reject everything at or above the
+// snapshot - would let a writer overwrite a version committed at exactly that
+// timestamp. The two rules would then disagree in a one-timestamp-wide band, and
+// a writer could overwrite a commit it had just observed: a lost update. Making
+// both comparisons strict keeps them exact complements, so a write is refused
+// unless the newest version really is older than the reader's snapshot.
 func (s *Store) latestVersionAt(key Key, startTS Timestamp) (Version, bool) {
 	versions := s.versions[key]
 	best := -1
 	for i := range versions {
-		if versions[i].CommitTS <= startTS {
+		if versions[i].CommitTS < startTS {
 			best = i
 		} else {
 			break
@@ -420,19 +430,24 @@ func (s *Store) checkPrewriteOp(req PrewriteRequest, op WriteOp, expiresAt uint6
 	return TxnResult{}, false
 }
 
-// writeConflict reports whether key carries a committed version newer than the
-// writer's snapshot.
+// writeConflict reports whether key carries a committed version that is not
+// visible to the writer's snapshot.
+//
+// The comparison is `>=`, the exact complement of the strict `<` that
+// latestVersionAt uses for visibility. The two must agree, or there is a band of
+// timestamps where a version is invisible to reads yet does not block writes -
+// and a writer inside that band overwrites a commit it never saw.
 func (s *Store) writeConflict(key Key, startTS Timestamp) (Timestamp, Timestamp, bool) {
 	versions := s.versions[key]
 	if len(versions) == 0 {
 		return 0, 0, false
 	}
 	newest := versions[len(versions)-1]
-	if newest.CommitTS > startTS {
-		// The newest version is newer than our snapshot. Report the oldest such
-		// version, which is the one we are in conflict with.
+	if newest.CommitTS >= startTS {
+		// The newest version is not visible to our snapshot. Report the oldest
+		// such version, which is the one we are in conflict with.
 		for i := range versions {
-			if versions[i].CommitTS > startTS {
+			if versions[i].CommitTS >= startTS {
 				return versions[i].StartTS, versions[i].CommitTS, true
 			}
 		}
@@ -847,6 +862,16 @@ func (s *Store) ValueAtNow(key Key) (Value, bool) {
 
 // ValueAt reads key as of the snapshot ts. Test-only.
 func (s *Store) ValueAt(key Key, ts Timestamp) (Value, bool) { return s.valueAt(key, ts) }
+
+// VersionsFor returns a copy of key's committed version chain, oldest first.
+// Test-only: it exists so a test can report *why* a value is what it is rather
+// than just that it is wrong.
+func (s *Store) VersionsFor(key Key) []Version {
+	src := s.versions[key]
+	out := make([]Version, len(src))
+	copy(out, src)
+	return out
+}
 
 func (s *Store) valueAt(key Key, ts Timestamp) (Value, bool) {
 	v, found := s.latestVersionAt(key, ts)

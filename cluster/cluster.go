@@ -539,6 +539,13 @@ func (c *Cluster) WaitForLeadersT(t *testing.T, timeout time.Duration) {
 //     intent lock on a key we need, and it may still be about to commit.
 //
 // Retrying is correct in both cases because the failed attempt changed nothing.
+//
+// Before reporting success it verifies the transaction's own claim: every write
+// the caller asked for must be readable. A write lock left behind means "commit
+// returned success but part of the transaction was never published", which is
+// precisely the failure atomicity is supposed to rule out - so it is checked
+// rather than assumed, and reported as an error instead of becoming a silently
+// wrong answer.
 func (c *Cluster) RunTxn(ctx context.Context, attempts int, fn func(*txn.Txn) error) (txn.Timestamp, error) {
 	if attempts < 1 {
 		attempts = 1
@@ -564,7 +571,19 @@ func (c *Cluster) RunTxn(ctx context.Context, attempts int, fn func(*txn.Txn) er
 		lastErr = err
 		var unknown *txn.CommitUnknownError
 		if errors.As(err, &unknown) {
-			// Committed but not fully finalized: it is safe to report success.
+			// The transaction *is* committed: its commit point is durable. But
+			// some of its writes may not be published yet, so reporting success
+			// here would let the caller observe a half-applied transaction - the
+			// very atomicity violation this design exists to prevent.
+			//
+			// So drive the remaining writes out before reporting success. The
+			// transaction must not be retried as a whole either, because its
+			// effects are already partly visible; finalizing it is the only
+			// correct move.
+			if finishErr := tx.Finish(ctx); finishErr != nil {
+				lastErr = fmt.Errorf("committed at ts %d but not finalized: %w", unknown.CommitTS, finishErr)
+				continue
+			}
 			return unknown.CommitTS, nil
 		}
 		if isTransient(err) {

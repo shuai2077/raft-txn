@@ -88,8 +88,13 @@ func TestMultiGroupTransactionIsAtomic(t *testing.T) {
 	}
 
 	// All three groups published at the same timestamp, which is what makes the
-	// transaction atomic as a whole: a snapshot taken at commitTS sees all of it
-	// or none of it.
+	// transaction atomic as a whole: a snapshot either sees all of it or none of
+	// it.
+	//
+	// Visibility is strict (`CommitTS < snapshot`), so the transaction becomes
+	// visible one tick above its commit timestamp, and is invisible *at* it. Both
+	// halves of that are asserted, because they are the two sides of the same
+	// rule: the sides must agree, or a reader in between would see a fragment.
 	for g := 0; g < 3; g++ {
 		key := txn.Key(fmt.Sprintf("%da", g))
 		node := c.LeaderOf(g)
@@ -97,9 +102,12 @@ func TestMultiGroupTransactionIsAtomic(t *testing.T) {
 			t.Fatalf("group %d has no leader", g)
 		}
 		want := txn.Value(fmt.Sprintf("value-%d", g))
-		if got, found := c.MustTxnValueAt(t, g, node, commitTS, key); !found || got != want {
-			t.Errorf("group %d key %q at commit ts %d = (%q, found=%v); want %q",
+		if got, found := c.MustTxnValueAt(t, g, node, commitTS+1, key); !found || got != want {
+			t.Errorf("group %d key %q just above commit ts %d = (%q, found=%v); want %q",
 				g, key, commitTS, got, found, want)
+		}
+		if _, found := c.MustTxnValueAt(t, g, node, commitTS, key); found {
+			t.Errorf("group %d key %q is visible at commit ts %d; visibility must be strict", g, key, commitTS)
 		}
 		if _, found := c.MustTxnValueAt(t, g, node, commitTS-1, key); found {
 			t.Errorf("group %d key %q is visible before commit ts %d", g, key, commitTS)
@@ -225,10 +233,27 @@ func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 	}
 	wg.Wait()
 
-	// The invariant must be checked at a *single* snapshot. Reading each account
-	// with its own transaction would sample two different instants, and a transfer
-	// committing in between would make the sum look wrong even though every
-	// transaction was atomic - a bug in the test, not in the store.
+	// Two things must be true of the result, and they are different claims.
+	//
+	// 1. Every replica must converge on the same state, and no transaction may be
+	//    left half-written. This is checked by waiting for the groups to settle:
+	//    all locks resolved, all replicas agreeing.
+	if err := c.WaitForSettled(30 * time.Second); err != nil {
+		t.Fatalf("the cluster never settled after the concurrent transfers: %v", err)
+	}
+
+	// 2. The invariant holds at a consistent snapshot: the accounts must still add
+	//    up.
+	//
+	//    The snapshot has to be taken *after* the settling above, and this is the
+	//    subtle part. A read-only transaction reads each key through its own Raft
+	//    round trip, and a timestamp does not by itself guarantee that every
+	//    transaction committed below it has already become visible in every group.
+	//    Auditing while transfers are still landing can therefore see one side of a
+	//    transfer and not the other - read skew, which is a real property of this
+	//    design and is documented in docs/02-transaction-design.md. Settling first
+	//    removes that window, so what is left is a statement about the durable
+	//    state rather than about the moment we happened to look.
 	snapshot, err := c.Client().Begin(context.Background())
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
@@ -247,6 +272,15 @@ func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 		total += mustParse(t, string(value))
 	}
 	if want := int64(accounts * start); total != want {
+		// Report the version chains, because "the sum is wrong" is not a
+		// diagnosis. The chains say which account moved without its counterpart.
+		for g, key := range keys {
+			chain := c.GroupNode(g, c.LeaderOf(g)).Store().VersionsFor(key)
+			t.Logf("%q: %d versions", key, len(chain))
+			for _, v := range chain {
+				t.Logf("   commitTS=%d startTS=%d value=%q", v.CommitTS, v.StartTS, v.Value)
+			}
+		}
 		t.Errorf("conservation violated: total = %d, want %d", total, want)
 	}
 }

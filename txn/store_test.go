@@ -45,9 +45,14 @@ func TestStorePrewriteCommitAndRead(t *testing.T) {
 	if r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: 19, Key: "a"}}).(TxnResult); r.Found {
 		t.Fatalf("read at ts=19 found %q; want nothing (commit was at 20)", r.Value)
 	}
-	// Exactly at the commit timestamp the value is visible.
-	if r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: 20, Key: "a"}}).(TxnResult); !r.Found {
-		t.Fatal("read at ts=20 found nothing; want the committed value")
+	// Visibility is strict: a snapshot is a point *before* which versions are
+	// visible, so the version committed at 20 is not visible at 20. Reading at 21
+	// is where it appears.
+	if r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: 20, Key: "a"}}).(TxnResult); r.Found {
+		t.Fatalf("read at ts=20 found %q; visibility must be strict (CommitTS < snapshot)", r.Value)
+	}
+	if r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: 21, Key: "a"}}).(TxnResult); !r.Found {
+		t.Fatal("read at ts=21 found nothing; want the committed value")
 	}
 	if lock := dl.store.LockedKeys(); len(lock) != 0 {
 		t.Fatalf("locks after commit: %v, want none", lock)
@@ -77,17 +82,19 @@ func TestStoreSnapshotIsolation(t *testing.T) {
 	commit(3, 3, "k", "three", 25, 30)
 
 	// Every snapshot must resolve to exactly the version valid at that instant.
+	// Visibility is strict (`CommitTS < snapshot`), so a commit is first visible
+	// one tick above its timestamp.
 	cases := []struct {
 		startTS Timestamp
 		want    string
 		found   bool
 	}{
 		{4, "", false}, // before any write
-		{10, "one", true},
+		{11, "one", true},
 		{12, "one", true},
-		{20, "two", true},
+		{21, "two", true},
 		{29, "two", true},
-		{30, "three", true},
+		{31, "three", true},
 		{1000, "three", true},
 	}
 	for _, c := range cases {
@@ -270,7 +277,8 @@ func TestStoreOneShotPrewriteCommitsInOneEntry(t *testing.T) {
 		t.Fatalf("locks after one-shot commit: %v, want none", locks)
 	}
 	for key, want := range map[Key]Value{"a": "x", "b": "y"} {
-		r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: 25, Key: key}}).(TxnResult)
+		// Read one tick above the commit timestamp: visibility is strict.
+		r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: 26, Key: key}}).(TxnResult)
 		if !r.Found || r.Value != want {
 			t.Errorf("read %q: got (%q, %v), want %q", key, r.Value, r.Found, want)
 		}
@@ -284,6 +292,77 @@ func TestStoreOneShotPrewriteCommitsInOneEntry(t *testing.T) {
 	}}).(TxnResult)
 	if res.Status != StatusCommitTSOutOfOrder {
 		t.Fatalf("got status=%s, want commit-ts-out-of-order", res.Status)
+	}
+}
+
+// TestStoreNoLostUpdateAtTheSnapshotBoundary is a regression test for a lost
+// update the original comparisons allowed.
+//
+// Visibility used to be `CommitTS <= snapshot` while conflict detection used
+// `CommitTS > snapshot`. The two rules disagreed in a one-timestamp-wide band: a
+// version committed at exactly the snapshot timestamp was visible to reads yet
+// did not block writes. A transaction could therefore read a value, have a
+// concurrent writer commit at that same timestamp, and then overwrite it - the
+// classic lost update, silently, with both transactions reporting success.
+//
+// Both comparisons are now strict, and this test walks that exact interleaving.
+func TestStoreNoLostUpdateAtTheSnapshotBoundary(t *testing.T) {
+	const snap = Timestamp(10)
+	// The commit must be strictly above the snapshot (a transaction cannot commit at
+	// its own start timestamp), so the boundary case is: a writer at snap that must
+	// be refused a version committed at commitTS.
+	const commitTS = Timestamp(11)
+
+	dl := newDirectLog(0)
+	dl.store.SetLockTTL(time.Hour)
+
+	prewrite := func(txnID TxnID, startTS Timestamp, key Key, value Value) TxnResult {
+		t.Helper()
+		return dl.store.Apply(TxnCommand{Kind: CmdPrewrite, PrewriteArgs: &PrewriteRequest{
+			TxnID: txnID, RequestID: int64(txnID), StartTS: startTS, Primary: key,
+			Ops: []WriteOp{NewPut(key, value)},
+		}}).(TxnResult)
+	}
+
+	// A transaction writes the key and commits at exactly its own snapshot
+	// timestamp: the boundary that used to be the hole.
+	if res := prewrite(1, snap, "k", "first"); res.Status != StatusOK {
+		t.Fatalf("first prewrite: %s (%s)", res.Status, res.Err)
+	}
+	if res := dl.store.Apply(TxnCommand{Kind: CmdCommit, CommitArgs: &CommitRequest{
+		TxnID: 1, RequestID: 100, StartTS: snap, CommitTS: commitTS, Keys: []Key{"k"},
+	}}).(TxnResult); res.Status != StatusOK {
+		t.Fatalf("commit: %s (%s)", res.Status, res.Err)
+	}
+
+	// A *second* transaction holding that same snapshot must not be allowed to
+	// clobber it. Under the old rule this write was accepted, so "first" was lost
+	// even though its commit had reported success.
+	res := prewrite(2, snap, "k", "second")
+	if res.Status != StatusWriteConflict {
+		t.Fatalf("writer at snapshot %d after a commit at %d: got status=%s, want write-conflict",
+			snap, snap, res.Status)
+	}
+	if res.ConflictCommit != commitTS {
+		t.Errorf("conflict names commit ts %d, want %d", res.ConflictCommit, commitTS)
+	}
+	if locks := dl.store.lockedKeysFor(2); len(locks) != 0 {
+		t.Fatalf("the refused transaction left locks behind: %v", locks)
+	}
+
+	// Reading at the same instant must agree: the version is not visible either,
+	// because visibility is strict too. Read and conflict are complements.
+	if r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: snap, Key: "k"}}).(TxnResult); r.Found {
+		t.Fatalf("read at the commit timestamp found %q; visibility must be strict", r.Value)
+	}
+	if r := dl.store.Apply(TxnCommand{Kind: CmdRead, ReadArgs: &ReadArgs{StartTS: commitTS + 1, Key: "k"}}).(TxnResult); !r.Found || r.Value != "first" {
+		t.Fatalf("read just above the commit timestamp: got (%q, %v), want first", r.Value, r.Found)
+	}
+
+	// A writer on the safe side of the boundary succeeds, so the rule is not
+	// simply refusing everything.
+	if res := prewrite(3, commitTS+1, "k", "later"); res.Status != StatusOK {
+		t.Fatalf("writer above the commit timestamp: got status=%s, want OK", res.Status)
 	}
 }
 
