@@ -341,6 +341,20 @@ type RollbackRequest struct {
 
 	StartTS Timestamp
 	Keys    []Key
+
+	// RecordDecision asks the group to record "this transaction aborted" as a
+	// durable decision before dropping any lock.
+	//
+	// It exists so a reader can recover a transaction whose coordinator is gone.
+	// A crashed coordinator cannot be relied on to have written an abort decision,
+	// and a reader must not infer one from a lapsed lease - that inference is what
+	// let a reader destroy a write its owner was still about to commit. So the
+	// reader *creates* the decision instead, atomically: the group re-checks the
+	// transaction's state and refuses to abort one that has committed.
+	//
+	// The coordinator sets it on its own abort path too, which makes the primary's
+	// decision precede any secondary rollback in every case.
+	RecordDecision bool
 }
 
 // Partitioner decides which Raft group owns a key. Routing is deliberately an

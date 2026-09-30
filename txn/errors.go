@@ -28,6 +28,13 @@ const (
 	StatusAlreadyCommitted
 	// StatusTxnNotFound means the named transaction has no state on this group.
 	StatusTxnNotFound
+	// StatusAlreadyAborted means the group has durably recorded that this
+	// transaction aborted, so it can never be sealed or committed.
+	//
+	// It is the counterpart of StatusAlreadyCommitted, and it is what makes
+	// rollback safe: a reader may only discard a lock once this decision exists,
+	// because the decision is what stops the owner from committing afterwards.
+	StatusAlreadyAborted
 	// StatusKeyNotInWriteSet means the coordinator and the state machine disagree
 	// about the transaction's write set, which indicates a bug.
 	StatusKeyNotInWriteSet
@@ -46,6 +53,7 @@ var statusNames = map[Status]string{
 	StatusWriteConflict:      "write-conflict",
 	StatusAlreadyCommitted:   "already-committed",
 	StatusTxnNotFound:        "txn-not-found",
+	StatusAlreadyAborted:     "already-aborted",
 	StatusKeyNotInWriteSet:   "key-not-in-write-set",
 	StatusCommitTSOutOfOrder: "commit-ts-out-of-order",
 	StatusInternal:           "internal",
@@ -155,6 +163,15 @@ func (e *KeyNotFoundError) Error() string {
 // out whether that resolution committed or aborted the transaction.
 var ErrLockGone = errors.New("txn: intent lock not held")
 
+// ErrAlreadyAborted reports that a transaction carries a durable abort decision
+// and can never commit.
+//
+// Callers must treat it as terminal for the transaction, not as a retryable
+// failure: the decision was written through Raft, so re-proposing the seal cannot
+// change it, and any write the transaction had prepared has already been
+// discarded by design.
+var ErrAlreadyAborted = errors.New("txn: transaction was durably aborted")
+
 // CommitUnknownError reports that a transaction definitely committed, but the
 // coordinator failed to finish (or to observe the completion of) the last step.
 //
@@ -234,6 +251,10 @@ func ErrorForStatus(st Status, key Key, lock *LockInfo, minCommitTS Timestamp,
 		return &LockedError{Key: key, Lock: lock.TxnLock(), MinCommitTS: minCommitTS}
 	case StatusWriteConflict:
 		return &WriteConflictError{Key: key, StartTS: conflictStart, CommitTS: conflictCommit}
+	case StatusTxnNotFound:
+		return &TxnNotFoundError{TxnID: 0}
+	case StatusAlreadyAborted:
+		return ErrAlreadyAborted
 	default:
 		return fmt.Errorf("txn: unexpected status %s", st)
 	}

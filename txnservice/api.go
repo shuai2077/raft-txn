@@ -67,6 +67,11 @@ type RollbackRequest struct {
 	RequestID int64    `json:"request_id"`
 	StartTS   uint64   `json:"start_ts"`
 	Keys      []string `json:"keys"`
+	// RecordDecision asks the group to durably record "this transaction aborted"
+	// before dropping any lock. A reader uses it to recover a transaction whose
+	// coordinator is gone, because a lapsed lease alone must never justify
+	// discarding a lock whose owner can still commit.
+	RecordDecision bool `json:"record_decision,omitempty"`
 }
 
 // SealRequest records a transaction's decision in one of its lock records.
@@ -167,6 +172,8 @@ type LockedResponse struct {
 const (
 	WStatusOK               = "ok"
 	WStatusAlreadyCommitted = "already-committed"
+	WStatusAlreadyAborted   = "already-aborted"
+	WStatusTxnNotFound      = "txn-not-found"
 	WStatusLocked           = "locked"
 	WStatusWriteConflict    = "write-conflict"
 	WStatusKeyNotInWriteSet = "key-not-in-write-set"

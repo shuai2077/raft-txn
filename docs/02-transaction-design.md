@@ -308,36 +308,31 @@ proposed to the group. Closing that needs a barrier against the timestamp oracle
 a registry of which allocated timestamps have finished — and that is not
 implemented.
 
-### 7.6 The lease-rollback race (open, and it breaks atomicity)
+### 7.6 The lease-rollback race (fixed)
 
 Chasing the remaining conservation failures turned up something more serious than
-read skew, and it is recorded in full in docs/03-read-barrier.md §2. In short:
+read skew. After a quiescent run, one account's version chain contained commit
+timestamp 44 and the other's did not: a transaction committed in one group and not
+the other, which is exactly the atomicity violation this design exists to prevent.
 
-* A lock lease can lapse while the coordinator is still working (it may be waiting
-  out another transaction's lock, which can take up to `resolveTimeout`).
-* A reader that finds a lapsed lock whose primary is still unsealed concludes the
-  owner is dead and rolls it back.
-* The coordinator then seals the primary and commits a transaction whose other
-  write has already been discarded.
+The mechanism, and the fix, are in docs/03-read-barrier.md §2. In short, recovery
+used to **infer** death from a lapsed lease: a reader that found an expired lock whose
+primary was still unsealed concluded the owner was dead and rolled the lock back,
+after which the coordinator sealed the primary and committed a transaction whose
+other write had already been discarded.
 
-Evidence: after a quiescent run, one account's version chain contained commit
-timestamp 44 and the other's did not — a commit present in one group and absent
-from the other.
+Recovery is now a **compare-and-abort recorded through Raft**. The lease still gates
+*when* recovery may be attempted, but the abort is a `CmdRollback` carrying
+`RecordDecision`, applied at the primary group, which re-checks the transaction's
+state first: it returns `StatusAlreadyCommitted` if the owner won the race, and
+records `StateAborted` durably otherwise. `Store.seal` refuses to seal an aborted
+transaction, and `Txn.abortLockedGroups` aborts the primary before any secondary. So
+publishing requires the commit decision and discarding requires the abort decision,
+and both are single entries applied in one order on one group — there is no
+interleaving that leaves one write published and the other gone.
 
-`Txn.verifyLocksHeld` now checks that every intent lock is still held **before** the
-commit point is written, and aborts with `LockRolledBackError` (retryable) if any
-lock is gone. That is correct and removes the common case, but it narrows the race
-rather than closing it: the check is a read, not a reservation, so a lease can still
-lapse between the check and the seal. Closing it properly needs a tombstone in the
-primary group (the Percolator approach), or the same oracle-side completion
-registry §7.5 needs.
-
-**Consequence, stated plainly:** until that is fixed, this store does not guarantee
-that all writes of a committed transaction are present. It guarantees they appear
-eventually for transactions whose coordinator stays alive and whose locks are not
-reclaimed. `TestConcurrentTransfersPreserveInvariant` fails intermittently for this
-reason and is deliberately left enabled rather than skipped, so the defect stays
-visible.
+`Txn.verifyLocksHeld` remains as a cheap pre-commit check that turns a lost lock into
+a clean, retryable `LockRolledBackError` instead of a wasted commit.
 
 ### 7.7 Not serializable, deliberately
 

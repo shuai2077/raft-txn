@@ -808,37 +808,73 @@ func (t *Txn) commitSecondary(ctx context.Context, group GroupID, commitTS Times
 
 // abortLockedGroups removes the locks the transaction installed. It is used both
 // by the user-facing Abort and by the failure path of Commit.
+// abortLockedGroups releases every intent lock this transaction took.
+//
+// The primary group is aborted *first*, and that ordering is a correctness
+// requirement rather than a tidy-up. The primary's abort is the durable decision
+// that tells every other reader this transaction can no longer commit: once it is
+// recorded, a coordinator that tries to seal will be refused. Dropping a secondary
+// lock before the decision exists would leave a window in which a reader has
+// destroyed a write belonging to a transaction that is still able to commit, which
+// is exactly the lost-write race this ordering removes.
 func (t *Txn) abortLockedGroups(ctx context.Context) error {
 	var firstErr error
-	for group := range t.prepared {
-		participant, err := t.c.participant(group)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
+
+	// The primary first, and only the keys this group owns.
+	primaryGroup := t.c.partitioner.GroupForKey(t.primaryKey)
+	if _, prepared := t.prepared[primaryGroup]; prepared {
+		keys := keysInGroup(t.c.partitioner, t.writes, primaryGroup)
+		if len(keys) > 0 {
+			if err := t.rollbackKeys(ctx, primaryGroup, keys); err != nil {
+				// If the primary cannot be aborted, nothing else may be dropped:
+				// without the decision, a secondary rollback is unsafe.
+				return err
 			}
+		}
+	}
+
+	for group := range t.prepared {
+		if group == primaryGroup {
 			continue
 		}
-		keys := make([]Key, 0, len(t.writes))
-		for key := range t.writes {
-			if t.c.partitioner.GroupForKey(key) == group {
-				keys = append(keys, key)
-			}
-		}
+		keys := keysInGroup(t.c.partitioner, t.writes, group)
 		if len(keys) == 0 {
 			continue
 		}
-		sortKeys(keys)
-		if err := participant.Rollback(ctx, RollbackRequest{
-			TxnID:     t.id,
-			ClientID:  t.c.clientID,
-			RequestID: t.c.nextRequestID(),
-			StartTS:   t.startTS,
-			Keys:      keys,
-		}); err != nil && firstErr == nil {
+		if err := t.rollbackKeys(ctx, group, keys); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+// rollbackKeys asks one group to discard the given locks.
+func (t *Txn) rollbackKeys(ctx context.Context, group GroupID, keys []Key) error {
+	participant, err := t.c.participant(group)
+	if err != nil {
+		return err
+	}
+	sortKeys(keys)
+	return participant.Rollback(ctx, RollbackRequest{
+		TxnID:     t.id,
+		ClientID:  t.c.clientID,
+		RequestID: t.c.nextRequestID(),
+		StartTS:   t.startTS,
+		Keys:      keys,
+	})
+}
+
+// keysInGroup returns the transaction's written keys that belong to group, in
+// deterministic order.
+func keysInGroup(partitioner Partitioner, writes map[Key]WriteOp, group GroupID) []Key {
+	keys := make([]Key, 0, len(writes))
+	for key := range writes {
+		if partitioner.GroupForKey(key) == group {
+			keys = append(keys, key)
+		}
+	}
+	sortKeys(keys)
+	return keys
 }
 
 // queryPrimaryDecision asks a group what it knows about a transaction's primary
@@ -930,8 +966,25 @@ func (c *Client) probePrimary(ctx context.Context, group GroupID, txnID TxnID,
 	return state, commitTS, info, nil
 }
 
-// ensurePrimaryResolved waits until the transaction that owns lock has decided
-// (committed) or is provably dead, so that the caller can act on the answer.
+// ensurePrimaryResolved waits until the transaction that owns lock has either
+// committed or been durably aborted at its primary group, and reports which.
+//
+// It deliberately never infers "dead" from an expired lease. A lapsed lease means
+// the coordinator has not refreshed the lock recently; it does not mean the
+// coordinator cannot still seal the commit point, and sealing is what makes the
+// transaction committed. Reporting a merely-slow transaction as dead is what let a
+// reader roll back a secondary lock that its owner was still about to commit, which
+// lost an acknowledged write.
+//
+// So the lease gates *when* recovery may be attempted, and a durable
+// compare-and-abort decides *whether* the transaction dies:
+//
+//   - while the lock is live, wait: the owner is entitled to finish;
+//   - once it has lapsed, ask the primary group to record an abort, which that
+//     group refuses if the transaction committed first.
+//
+// The lease therefore bounds how long a reader waits, and the Raft-ordered
+// decision bounds correctness. Neither does the other's job.
 func (c *Client) ensurePrimaryResolved(ctx context.Context, lock TxnLock) (State, Timestamp, error) {
 	primaryGroup := c.partitioner.GroupForKey(lock.Primary)
 	deadline := time.Now().Add(c.resolveTimeoutOrDefault())
@@ -945,31 +998,54 @@ func (c *Client) ensurePrimaryResolved(ctx context.Context, lock TxnLock) (State
 		}
 		lastSeen, lastState = info, state
 
-		switch {
-		case state == StateCommitted:
+		switch state {
+		case StateCommitted:
 			return StateCommitted, commitTS, nil
-		case state == StateAborted:
-			return StateAborted, 0, nil
-		case info == nil:
-			// The primary group has no record of the transaction. It was rolled
-			// back and garbage collected, so it never committed.
+		case StateAborted:
 			return StateAborted, 0, nil
 		}
 
-		// Still prepared. Give a live owner a chance to finish; once its lease has
-		// expired, declare the transaction dead.
-		if !info.Expired(c.clock()()) {
+		// Undecided. Recovery may only be attempted once the owner's lease on the
+		// primary lock has lapsed; until then the owner is entitled to finish, and
+		// the caller waits.
+		//
+		// A missing record is treated as expired. That is the safe reading of "this
+		// group has nothing": there is no lease to respect, and the compare-and-abort
+		// below still refuses if the transaction turns out to have committed.
+		expired := info == nil || info.Expired(c.clock()())
+		if expired {
+			abortErr := c.abortAtPrimary(ctx, primaryGroup, lock.TxnID, lock.StartTS, lock.Primary)
+			if abortErr == nil {
+				return StateAborted, 0, nil
+			}
+			var already *AlreadyCommittedError
+			if errors.As(abortErr, &already) {
+				// The owner committed while we were deciding. Re-read to pick up the
+				// timestamp the group recorded.
+				_, ts, _, probeErr := c.probePrimary(ctx, primaryGroup, lock.TxnID, lock.Primary)
+				if probeErr == nil && ts != 0 {
+					return StateCommitted, ts, nil
+				}
+				return StateCommitted, already.CommitTS, nil
+			}
 			if time.Now().After(deadline) {
 				return StateInvalid, 0, fmt.Errorf(
-					"txn: timed out waiting for txn %d to decide about key %q (group %d last reported state=%v lock=%+v)",
-					lock.TxnID, lock.Primary, primaryGroup, lastState, lastSeen)
+					"txn: could not record the abort of txn %d (group %d last reported state=%v): %w",
+					lock.TxnID, primaryGroup, lastState, abortErr)
 			}
-			if err := sleepCtx(ctx, resolveBackoff(attempt)); err != nil {
-				return StateInvalid, 0, err
-			}
-			continue
+		} else if time.Now().After(deadline) {
+			// The owner is alive and simply slow. Report that plainly rather than
+			// rolling anything back.
+			return StateInvalid, 0, fmt.Errorf(
+				"txn: timed out waiting for txn %d to decide about key %q "+
+					"(group %d state=%v lock=%+v); refusing to roll the lock back "+
+					"because its lease has not lapsed and the owner may still commit",
+				lock.TxnID, lock.Primary, primaryGroup, lastState, lastSeen)
 		}
-		return StatePrepared, 0, nil
+
+		if err := sleepCtx(ctx, resolveBackoff(attempt)); err != nil {
+			return StateInvalid, 0, err
+		}
 	}
 }
 
@@ -1060,21 +1136,83 @@ func (r *DefaultResolver) ResolveLock(ctx context.Context, group GroupID, lock T
 		return nil
 	}
 
-	// The transaction is provably dead. The caller asked about `group`, so that
-	// is the lock it must be able to retry past; drop it first. The primary lock
-	// on the *primary* key is dropped too, so other readers stop consulting it,
-	// but only if it is actually held by this same transaction.
-	if err := c.rollbackLockOnKey(ctx, group, lock.TxnID, lock.StartTS, lock.Key); err != nil {
-		return err
+	if state != StateAborted {
+		// ensurePrimaryResolved only returns Committed, Aborted, or an error, so
+		// this is unreachable by design. It is checked rather than assumed because
+		// falling through would roll back a lock whose owner may still commit, and
+		// that is the one mistake this whole path exists to prevent.
+		return fmt.Errorf("txn: refusing to roll back the lock on %q: txn %d is in state %v, not aborted",
+			lock.Key, lock.TxnID, state)
 	}
+
 	primaryGroup := c.partitioner.GroupForKey(lock.Primary)
-	if primaryGroup != group || lock.Key != lock.Primary {
-		if err := c.rollbackLockOnKey(ctx, primaryGroup, lock.TxnID, lock.StartTS, lock.Primary); err != nil {
+
+	// The abort decision is already durable: ensurePrimaryResolved recorded it (or
+	// discovered that the transaction committed instead). Only now, with the owner
+	// unable to commit, may the locks be dropped. The caller asked about `group`,
+	// so that is the lock it must be able to retry past.
+	if err := c.rollbackLockOnKey(ctx, group, lock.TxnID, lock.StartTS, lock.Key); err != nil {
+		if !errors.Is(err, ErrLockGone) && !isAlreadyResolved(err) {
 			return err
+		}
+	}
+	if primaryGroup != group {
+		if err := c.rollbackLockOnKey(ctx, primaryGroup, lock.TxnID, lock.StartTS, lock.Primary); err != nil {
+			if !errors.Is(err, ErrLockGone) && !isAlreadyResolved(err) {
+				return err
+			}
 		}
 	}
 	c.bumpStat(func(cl *Client) { cl.staleLocksAborted++ })
 	return nil
+}
+
+// abortAtPrimary durably records "this transaction aborted" at the group that owns
+// its primary key, and reports the transaction's fate if that fate turns out to be
+// committed.
+//
+// It returns an error only when the decision could not be established at all. An
+// AlreadyCommitted outcome is surfaced as *AlreadyCommittedError, which callers
+// treat as "the transaction won the race" rather than as a failure.
+func (c *Client) abortAtPrimary(ctx context.Context, primaryGroup GroupID, txnID TxnID,
+	startTS Timestamp, primary Key) error {
+	participant, err := c.participant(primaryGroup)
+	if err != nil {
+		return err
+	}
+	err = participant.Rollback(ctx, RollbackRequest{
+		TxnID:          txnID,
+		ClientID:       c.clientID,
+		RequestID:      c.nextRequestID(),
+		StartTS:        startTS,
+		Keys:           []Key{primary},
+		RecordDecision: true,
+	})
+	if err == nil || errors.Is(err, ErrLockGone) {
+		return nil
+	}
+	var already *AlreadyCommittedError
+	if errors.As(err, &already) {
+		// The owner committed before we could abort it. Its lock on the primary key
+		// is gone because it was published; there is nothing to roll back, and the
+		// caller must not discard the secondary.
+		return err
+	}
+	// A group that never had this transaction cannot declare it aborted. That is
+	// not fatal: the caller's own group may still hold the locks, and a later
+	// attempt can succeed once the primary group has the record.
+	var notFound *TxnNotFoundError
+	if errors.As(err, &notFound) {
+		return err
+	}
+	return fmt.Errorf("txn: recording the abort of %d at group %d: %w", txnID, primaryGroup, err)
+}
+
+// isAlreadyResolved reports whether an error means the work was done by someone
+// else, which is success for an idempotent recovery step.
+func isAlreadyResolved(err error) bool {
+	var committed *AlreadyCommittedError
+	return errors.As(err, &committed)
 }
 
 // rollbackLockOnKey discards the lock held on one specific key, leaving any other

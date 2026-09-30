@@ -501,6 +501,19 @@ func (s *Store) seal(args SealArgs) TxnResult {
 		return TxnResult{Status: StatusCommitTSOutOfOrder, Err: fmt.Sprintf(
 			"commit ts %d is not greater than start ts %d", args.CommitTS, lock.StartTS)}
 	}
+	// A transaction that has been durably aborted can never be sealed, whatever
+	// the state of this particular lock record.
+	//
+	// This is the other half of the mutual exclusion that makes rollback safe. A
+	// reader may only roll a lock back after recording the abort at the primary
+	// group; that record is produced by the same Raft apply loop that produces this
+	// seal, so exactly one of the two can win. If the abort won, the write it
+	// discarded must stay discarded - sealing anyway would resurrect a commit whose
+	// other half is already gone.
+	if state, ok := s.actorState(args.TxnID); ok && state == StateAborted {
+		return TxnResult{Status: StatusAlreadyAborted, State: StateAborted,
+			Err: fmt.Sprintf("txn %d was aborted and can no longer commit", args.TxnID)}
+	}
 	if lock.CommitTS != 0 && lock.CommitTS != args.CommitTS {
 		return TxnResult{Status: StatusInternal, Err: fmt.Sprintf(
 			"lock on %q is already sealed at ts %d", args.Key, lock.CommitTS)}
@@ -687,6 +700,35 @@ func (s *Store) rollback(req RollbackRequest) TxnResult {
 			Status: StatusAlreadyCommitted, State: StateCommitted, CommitTS: actor.CommitTS})
 	}
 
+	// When the caller is recording the abort decision, refuse to do so without a
+	// lock record naming which keys the transaction actually touched.
+	//
+	// Without this, a *retried* rollback request - the memo entry gone, the keys
+	// already dropped - would create a fresh aborted actor for a transaction this
+	// group may be about to finish committing. Requiring positive evidence that the
+	// transaction was prepared here makes "abort" a statement about a transaction
+	// this group really knows about.
+	if req.RecordDecision && len(req.Keys) > 0 {
+		known := false
+		for _, key := range req.Keys {
+			if lock, ok := s.locks[key]; ok && lock.TxnID == req.TxnID {
+				known = true
+				break
+			}
+		}
+		if !known {
+			if actor, ok := s.actors[req.TxnID]; !ok || actor.State != StateAborted {
+				// Nothing here proves this transaction was ever prepared in this
+				// group, so this group cannot declare it aborted. The caller must
+				// ask the group that owns the primary key.
+				return s.memoize(req.TxnID, req.ClientID, req.RequestID, TxnResult{
+					Status: StatusTxnNotFound, State: StateInvalid,
+					Err: fmt.Sprintf("no lock record for txn %d; cannot record an abort decision here",
+						req.TxnID)})
+			}
+		}
+	}
+
 	removed := 0
 	keys := req.Keys
 	if len(keys) == 0 {
@@ -702,6 +744,11 @@ func (s *Store) rollback(req RollbackRequest) TxnResult {
 	actor := s.actorOrCreate(req.TxnID)
 	if !actor.State.Final() {
 		actor.State = StateAborted
+	}
+	if removed > 0 {
+		// An aborted transaction owns no further versions, and the group should not
+		// remember its key set: a later commit must find nothing to publish.
+		actor.Keys = nil
 	}
 	return s.memoize(req.TxnID, req.ClientID, req.RequestID, TxnResult{
 		Status: StatusOK, State: actor.State, KeysFinalized: removed})

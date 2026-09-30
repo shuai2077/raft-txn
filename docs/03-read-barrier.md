@@ -167,52 +167,89 @@ coordinator   ->  seals the primary (too late)
 The prewrite-to-seal window is long whenever the coordinator waits out another
 transaction's lock (up to `resolveTimeout`, 2 s here) while the lease is 1 s.
 
-### 2.3 What is fixed
+### 2.3 The fix: recovery is a decision, not a guess
 
-`Txn.verifyLocksHeld` runs **between prewrite and the commit point** and refuses to
-seal if any intent lock is gone. If a lock has been rolled back then no commit
-point exists and nothing was published, so the transaction is still entirely
-invisible and aborting is safe. It returns `LockRolledBackError`, which
-`Cluster.isTransient` treats as retryable, so callers simply run the transaction
-again.
+The root defect was that recovery **inferred** death from a lapsed lease. Three
+places did that:
 
-The ordering is the point: the check has to happen *before* the seal, because
-sealing later cannot repair a discarded write.
+```
+ensurePrimaryResolved:  primary still prepared, lease expired -> StatePrepared
+ResolveLock:            anything that is not StateCommitted    -> "provably dead", roll back
+probePrimary:           primary group has no record            -> "aborted"
+```
 
-### 2.4 What is still open
+All three treat absence of evidence as evidence of death. A lease is only a promise
+that the owner will refresh the lock; it says nothing about whether the owner can
+still seal the commit point, and sealing is what commits. So a reader could discard
+a write whose owner was still about to commit it.
 
-**The race is narrowed, not closed.** `verifyLocksHeld` is a read, not an atomic
-reservation. Between the check and the seal, a lease can still lapse and a reader
-can still roll the lock back. Measured after the fix:
-`TestConcurrentTransfersPreserveInvariant` failed **10 times in 30**.
+Recovery is now a **compare-and-abort recorded through Raft**, which turns "may I
+discard this lock?" into a decision rather than an inference:
 
-The correct fix makes "may I roll this lock back?" a decision rather than a
-guess. A reader can only roll a lock back safely if the owning transaction can no
-longer commit, and a lease expiry does not establish that. Two shapes would:
+* the lease still gates **when** recovery may be attempted — while the lock is live
+  the owner is entitled to finish and the reader waits;
+* but the abort itself is a `CmdRollback` carrying `RecordDecision`, applied at the
+  **primary group**, and that group re-checks the transaction's state first.
 
-* **A tombstone in the primary group.** Before discarding a lapsed lock, the reader
-  records "transaction `X` is aborted" at `X`'s primary group. The coordinator's
-  seal then fails on a transaction already declared dead. This is the Percolator
-  approach and it genuinely closes the race; it costs an extra Raft write on the
-  recovery path and needs the tombstone to expire eventually.
-* **A completion registry at the oracle**, which is the same machinery §1.6 needs,
-  so the two open problems share a solution.
+If the transaction already committed, the group returns `StatusAlreadyCommitted` and
+the reader **publishes** the secondary write instead of destroying it. If it had not
+committed, the group records `StateAborted` durably. Because the seal and this
+decision are applied by the same Raft apply loop on the same group, exactly one of
+them can win — which is the mutual exclusion a lease cannot provide.
 
-Neither is implemented. Until one is, this store does **not** guarantee that a
-committed transaction's writes are all present: it guarantees that they all appear
-*eventually* for transactions whose coordinator stays alive and whose locks are not
-reclaimed, which is weaker than the documentation elsewhere implies.
+Two supporting changes make that airtight:
 
-### 2.5 Why the test still fails, and why that is the honest outcome
+* `Store.seal` refuses to seal a transaction that carries a durable abort decision
+  (`StatusAlreadyAborted`). Without it, a coordinator's seal could land after the
+  abort and resurrect a commit whose other half had already been discarded.
+* `Txn.abortLockedGroups` aborts the **primary group first** and returns early if
+  that fails, so the decision always precedes any secondary rollback. Only then may a
+  lock be dropped, because the decision is what makes dropping it safe.
 
-`TestConcurrentTransfersPreserveInvariant` asserts conservation. It fails roughly a
-third of the time because **the store really does violate conservation under
-concurrency**, by the mechanism in §2.4. The test is not flaky in the sense of
-being badly written; it is detecting a real defect that is not yet fixed. It is
-left failing and enabled rather than skipped or pinned with a tolerance, so the
-defect stays visible. `WaitForSettled` / `WaitForQuiescent` remain in it because
-they are needed to tell "the cluster has not converged" apart from "the cluster
-agrees on a wrong state", and the failure message reports that distinction.
+`Txn.verifyLocksHeld` remains as a cheap pre-commit check that refuses to seal over a
+lock that is already gone, reporting `LockRolledBackError` (retryable). It is now a
+fast path to a clean failure rather than the safety mechanism.
+
+### 2.4 Why the fix is complete
+
+There is no interleaving in which one write of a transaction is published and the
+other discarded, because publishing requires the commit decision and discarding
+requires the abort decision, and both are single entries applied in one order on the
+primary group:
+
+| Order of events | Outcome |
+| --- | --- |
+| Coordinator seals first | The reader's compare-and-abort sees `Committed`, so it publishes the secondary. Both writes land. |
+| Reader aborts first | The primary group records `StateAborted`; the coordinator's seal is refused, so **neither** write lands and the transaction is retried. |
+| The seal fails for a routing reason | The coordinator reports `CommitUnknownError`, `Finish` re-drives the secondaries, and any reader that trips a leftover lock consults the primary and publishes. |
+
+### 2.5 Verification
+
+The check that exposed the bug is kept as `TestCommitTimestampsPairUpAcrossGroups`.
+Every transfer writes one key in each of two groups with a shared commit timestamp,
+so after quiescence the two version chains must contain the same set of commit
+timestamps. It needs no correlation between a value and a transaction, no assumption
+about which node is authoritative, and no timing window — it compares the durable
+state of two groups against each other. Before the fix it failed within a handful of
+attempts; after it, 24 attempts pass.
+
+Two deterministic unit tests pin the two orderings directly, using the harness clock
+so no wall-clock wait is involved:
+
+* `TestSealedSecondaryIsNotLostWhenALeaseLapses` — lapse the leases, let a reader act
+  first, then commit; asserts the two groups agree about whether the write exists.
+* `TestLapsedLeaseAloneCannotAbortACommittedTransaction` — seal first, then lapse the
+  lease and read; asserts the reader publishes rather than discards.
+
+### 2.6 What this did *not* fix
+
+The cross-key snapshot gap of §1.5 is still open: a per-group barrier cannot cover a
+transaction that has been decided but whose write has not yet been proposed to a
+group. `TestConcurrentTransfersPreserveInvariant` audits one snapshot and can still
+observe an unbalanced total for that reason. That is a *read* consistency question,
+not a durability one: the writes are all present, as §2.5 establishes, but a snapshot
+read is not guaranteed to be a state the system was ever in. Closing it needs the
+oracle-side completion registry of §1.6.
 
 ---
 

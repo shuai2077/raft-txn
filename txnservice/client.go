@@ -198,11 +198,12 @@ func (gc *GroupClient) Commit(ctx context.Context, req txn.CommitRequest) error 
 // Rollback implements txn.Participant.
 func (gc *GroupClient) Rollback(ctx context.Context, req txn.RollbackRequest) error {
 	body := RollbackRequest{
-		TxnID:     uint64(req.TxnID),
-		ClientID:  req.ClientID,
-		RequestID: req.RequestID,
-		StartTS:   uint64(req.StartTS),
-		Keys:      keysToStrings(req.Keys),
+		TxnID:          uint64(req.TxnID),
+		ClientID:       req.ClientID,
+		RequestID:      req.RequestID,
+		StartTS:        uint64(req.StartTS),
+		Keys:           keysToStrings(req.Keys),
+		RecordDecision: req.RecordDecision,
 	}
 	var resp WriteResponse
 	if err := gc.roundTrip(ctx, "rollback", body, &resp); err != nil {
@@ -395,6 +396,12 @@ func convertError(status string, key txn.Key, lock *LockInfo, minCommitTS,
 	switch status {
 	case WStatusOK, WStatusAlreadyCommitted:
 		return nil
+	case WStatusAlreadyAborted:
+		return txn.ErrAlreadyAborted
+	case WStatusTxnNotFound:
+		return &txn.TxnNotFoundError{TxnID: 0}
+	case WStatusInternal:
+		return fmt.Errorf("txnservice: %s", text)
 	case WStatusLocked:
 		if lock == nil {
 			return fmt.Errorf("txnservice: key %q is locked (no lock payload)", key)

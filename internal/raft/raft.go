@@ -577,7 +577,17 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
 				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
-				cm.newCommitReadyChan <- struct{}{}
+				// Nudge the applier without blocking. This send happens while
+				// holding cm.mu, and the applier needs that same lock to make
+				// progress, so a blocking send can deadlock: a full buffer plus a
+				// lock-holding sender is a cycle, not backpressure. The notification
+				// is only a wake-up - the applier re-reads commitIndex under the lock
+				// - so dropping it when the buffer is full is safe, and a later nudge
+				// or the applier's own loop picks the entry up.
+				select {
+				case cm.newCommitReadyChan <- struct{}{}:
+				default:
+				}
 			}
 		} else {
 			// No match for PrevLogIndex/PrevLogTerm. Populate

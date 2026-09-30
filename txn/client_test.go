@@ -66,6 +66,150 @@ func TestVerifyLocksHeldRefusesAMissingSecondaryLock(t *testing.T) {
 	}
 }
 
+// TestSealedSecondaryIsNotLostWhenALeaseLapses is the regression test for the
+// lost-write race.
+//
+// The interleaving it reproduces, deterministically:
+//
+//  1. a cross-group transaction prepares, taking a lock in each group;
+//  2. its *secondary* lock lapses, while the coordinator has not yet sealed the
+//     primary - exactly what happens when the coordinator is waiting out another
+//     transaction;
+//  3. a reader trips over the lapsed secondary lock;
+//  4. only then does the coordinator commit.
+//
+// Before the fix, step 3 concluded "the owner is dead" from nothing but the lapsed
+// lease and rolled the lock back, so the coordinator's later commit published the
+// primary and silently dropped the secondary: a commit present in one group and
+// absent from the other. The fix makes recovery a compare-and-abort at the primary
+// group, so once the reader's abort is recorded the coordinator cannot seal, and if
+// the coordinator sealed first the reader publishes instead of discarding.
+//
+// Either outcome is acceptable; what must never happen is a commit whose other half
+// was thrown away. This asserts exactly that, following the coordinator's own
+// reported result rather than assuming which side won.
+func TestSealedSecondaryIsNotLostWhenALeaseLapses(t *testing.T) {
+	tc := newTestCluster(t, groupForPrefix{}, 2)
+	tc.SetLockTTL(time.Hour)
+	tc.FreezeClock(1_000_000)
+
+	writer := tc.Begin()
+	tc.MustPut(writer, "0a", "A")
+	tc.MustPut(writer, "1b", "B")
+	prep, err := tc.client.prewriteWrites(context.Background(), writer.id, writer.startTS, writer.writes)
+	if err != nil {
+		t.Fatalf("prewrite: %v", err)
+	}
+	if prep.primaryGroup != 0 {
+		t.Fatalf("primary group=%d, want 0 so the primary is the first key", prep.primaryGroup)
+	}
+	if len(prep.groups) != 2 {
+		t.Fatalf("prepared %d groups, want 2", len(prep.groups))
+	}
+
+	// Step 2: lapse the leases without touching the primary's decision.
+	tc.Advance(2 * time.Hour)
+
+	// Step 3: a reader trips over the secondary lock and recovers.
+	reader := tc.Begin()
+	_, _, _ = reader.Get(context.Background(), "1b")
+
+	// Step 4: the coordinator commits now, *after* the reader acted.
+	commitTS, commitErr := writer.Commit(context.Background())
+
+	// Whatever the coordinator reported, the two groups must agree about whether
+	// this transaction's write exists. "Committed" must mean both writes are
+	// visible; "refused" must mean neither is.
+	_, aFound := readCommitted(t, tc, 0, "0a")
+	_, bFound := readCommitted(t, tc, 1, "1b")
+
+	// The initial values were never written, so any visible value belongs to this
+	// transaction. Both keys start absent, so a present key means the write landed.
+	landed := 0
+	if aFound {
+		landed++
+	}
+	if bFound {
+		landed++
+	}
+
+	if commitErr == nil {
+		if landed != 2 {
+			t.Errorf("commit reported success (ts=%d) but only %d of its 2 writes are visible "+
+				"(0a=%v, 1b=%v): an acknowledged write was lost", commitTS, landed, aFound, bFound)
+		}
+		return
+	}
+
+	// The commit was refused. Then nothing may be visible, or the transaction would
+	// be half-applied even though it was never committed.
+	var abortedErr error = commitErr
+	if landed != 0 {
+		t.Errorf("commit was refused (%v) yet %d of its writes are visible (0a=%v, 1b=%v)",
+			abortedErr, landed, aFound, bFound)
+	}
+
+	// And the keys must be usable again: a refusal has to leave the system live, not
+	// wedged behind locks nobody will clear.
+	fresh := tc.Begin()
+	tc.MustPut(fresh, "0a", "retry-A")
+	tc.MustPut(fresh, "1b", "retry-B")
+	tc.MustCommit(fresh)
+	if v, ok := readCommitted(t, tc, 0, "0a"); !ok || v != "retry-A" {
+		t.Errorf("after the refused commit, 0a = (%q, %v); want retry-A", v, ok)
+	}
+	if v, ok := readCommitted(t, tc, 1, "1b"); !ok || v != "retry-B" {
+		t.Errorf("after the refused commit, 1b = (%q, %v); want retry-B", v, ok)
+	}
+}
+
+// TestLapsedLeaseAloneCannotAbortACommittedTransaction is the mirror case: the
+// coordinator seals first, and a later reader must publish rather than discard.
+//
+// The point is that the outcome is decided by which Raft entry is applied first,
+// not by whose lease looked expired - so a reader arriving late must find the commit
+// and finish it.
+func TestLapsedLeaseAloneCannotAbortACommittedTransaction(t *testing.T) {
+	tc := newTestCluster(t, groupForPrefix{}, 2)
+	tc.SetLockTTL(time.Hour)
+	tc.FreezeClock(1_000_000)
+
+	writer := tc.Begin()
+	tc.MustPut(writer, "0a", "A")
+	tc.MustPut(writer, "1b", "B")
+	tc.PrewriteAll(writer)
+
+	// Seal the primary: the transaction is now committed, but the secondary has not
+	// been published.
+	//
+	// The commit timestamp comes from the harness oracle so it stays above the
+	// writer's snapshot *and* below the reader's - otherwise the reader would be
+	// entitled to miss it, and this test would be checking the wrong thing.
+	cts, err := tc.oracle.CommitTS(context.Background(), writer.startTS)
+	if err != nil {
+		t.Fatalf("obtaining a commit timestamp: %v", err)
+	}
+	if err := tc.groups[0].Seal(context.Background(), "0a", writer.id, writer.startTS, cts); err != nil {
+		t.Fatalf("seal primary: %v", err)
+	}
+
+	// The secondary's lease lapses. A reader must still publish, because the commit
+	// is already decided.
+	tc.Advance(2 * time.Hour)
+
+	reader := tc.Begin()
+	value, found, err := reader.Get(context.Background(), "1b")
+	if err != nil {
+		t.Fatalf("read of the secondary: %v", err)
+	}
+	if !found || value != "B" {
+		t.Fatalf("read (%q, found=%v), want B: a committed write was discarded", value, found)
+	}
+	if locks := tc.Group(1).LockedKeys(); len(locks) != 0 {
+		t.Errorf("group 1 still holds locks %v after recovery", locks)
+	}
+}
+
 // readCommitted reads a key at "now" straight out of one group's state machine,
 // bypassing the transaction client. It is how tests observe what a group really
 // stores.

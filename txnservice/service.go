@@ -420,11 +420,12 @@ func (n *Node) handleRollback(w http.ResponseWriter, req *http.Request) {
 		keys = append(keys, txn.Key(k))
 	}
 	n.propose(w, req, txn.TxnCommand{Kind: txn.CmdRollback, RollbackArgs: &txn.RollbackRequest{
-		TxnID:     txn.TxnID(body.TxnID),
-		ClientID:  body.ClientID,
-		RequestID: body.RequestID,
-		StartTS:   txn.Timestamp(body.StartTS),
-		Keys:      keys,
+		TxnID:          txn.TxnID(body.TxnID),
+		ClientID:       body.ClientID,
+		RequestID:      body.RequestID,
+		StartTS:        txn.Timestamp(body.StartTS),
+		Keys:           keys,
+		RecordDecision: body.RecordDecision,
 	}}, func(res txn.TxnResult) any {
 		return WriteResponse{
 			ResponseStatus: responseStatus(res),
@@ -513,6 +514,10 @@ func statusFor(res txn.TxnResult) string {
 		return WStatusOK
 	case txn.StatusAlreadyCommitted:
 		return WStatusAlreadyCommitted
+	case txn.StatusAlreadyAborted:
+		return WStatusAlreadyAborted
+	case txn.StatusTxnNotFound:
+		return WStatusTxnNotFound
 	case txn.StatusLocked:
 		return WStatusLocked
 	case txn.StatusWriteConflict:

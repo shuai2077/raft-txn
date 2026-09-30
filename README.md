@@ -145,23 +145,27 @@ timestamps may be wasted but are never repeated.
   explicit list of what is *not* implemented.
 * **[docs/03-read-barrier.md](docs/03-read-barrier.md)** — the read barrier: what
   a cross-key snapshot read was missing, the log-position argument that closes it,
-  the property it deliberately does *not* provide, and a lease-rollback race found
-  while investigating it. **Read §2 of that document before trusting this store
-  with data**: it is a known, unfixed way for a committed transaction to lose a
-  write.
+  the property it deliberately does *not* provide, and the lease-rollback race that
+  was found while investigating it — including the fix, which makes recovery a
+  compare-and-abort recorded through Raft rather than an inference from a lapsed
+  lease.
 
 ## Status and limits
 
 This is a study implementation: it is complete and tested, but it is not a
 product. Read [§11 of the design
-doc](docs/02-transaction-design.md#11-not-implemented) and
-[§2 of the read-barrier doc](docs/03-read-barrier.md) before pointing it at
+doc](docs/02-transaction-design.md#11-not-implemented) before pointing it at
 anything you care about. In brief: snapshot isolation rather than serializable,
 no log compaction or snapshots, no dynamic membership, no version garbage
-collection, sequential group RPCs, and an open lease-rollback race that can lose a
-write of a committed transaction. `TestConcurrentTransfersPreserveInvariant` fails
-intermittently for that last reason and is left enabled so the defect stays
-visible.
+collection, and sequential group RPCs.
+
+One correctness limit is worth stating separately, because it is a *read*
+consistency property rather than a missing feature. A cross-key snapshot read is
+not guaranteed to be a state the system was ever in: a per-group read barrier
+cannot cover a transaction that has been decided but whose write has not yet been
+proposed to a group (docs/03-read-barrier.md §1.5 and §2.6). Writes are not lost —
+atomicity is enforced — but a multi-key read at one timestamp may mix two instants.
+Closing it needs a completion registry at the timestamp oracle.
 
 ## Credits and licence
 
