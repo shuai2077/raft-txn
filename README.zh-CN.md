@@ -82,10 +82,10 @@ go run ./cmd/demo
 | `txnservice/` | 把单个 Raft 组暴露为 HTTP 服务，以及访问它的客户端 |
 | `tso/` | 基于 Raft 复制的授时服务（timestamp oracle） |
 | `cluster/` | 整个 Multi-Raft 集群的装配，以及故障注入 |
-| `docs/` | [Raft 分析](docs/01-raft-analysis.md) · [事务设计](docs/02-transaction-design.md) |
+| `docs/` | [Raft 分析](docs/01-raft-analysis.md) · [事务设计](docs/02-transaction-design.md) · [读屏障](docs/03-read-barrier.md) |
 | `cmd/demo/` | 可直接运行的演示程序 |
 
-> 注：`docs/` 下的两份设计文档目前只有英文版。
+> 注：`docs/` 下的三份设计文档目前只有英文版。
 
 ## 一页读懂实现原理
 
@@ -132,13 +132,19 @@ go run ./cmd/demo
 * **[docs/02-transaction-design.md](docs/02-transaction-design.md)** —— 事务层：隔离模型、
   提交协议、锁解析规则及其背后的安全性论证、授时服务，以及一节关于「考虑过但被否决的设计
   方案」的讨论。文末明确列出了**尚未实现**的部分。
+* **[docs/03-read-barrier.md](docs/03-read-barrier.md)** —— 读屏障：跨键快照读原先缺失的是
+  什么、用日志位置给出的论证、它**刻意不提供**的保证，以及在排查过程中发现的一个租约回滚
+  竞态。**在把本仓库用于任何你在意的数据之前，请先读该文档第 2 节**：那是一个已知且尚未修复
+  的缺陷，会让一笔已提交的事务丢失它的某一次写入。
 
 ## 现状与局限
 
 这是一个学习性质的实现：它完整且有测试覆盖，但不是一个产品。在把它用于任何你在意的场景
-之前，请先阅读[设计文档第 11 节](docs/02-transaction-design.md#11-not-implemented)。简要
-来说：提供的是快照隔离而非可串行化；没有日志压缩与快照；不支持动态成员变更；没有版本垃圾
-回收；组间 RPC 是串行执行的。
+之前，请先阅读[设计文档第 11 节](docs/02-transaction-design.md#11-not-implemented)与
+[读屏障文档第 2 节](docs/03-read-barrier.md)。简要来说：提供的是快照隔离而非可串行化；
+没有日志压缩与快照；不支持动态成员变更；没有版本垃圾回收；组间 RPC 是串行执行的；并且存在
+一个尚未修复的租约回滚竞态，可能让已提交事务丢失写入 —— `TestConcurrentTransfersPreserveInvariant`
+正是因为这一点而间歇性失败，它被有意保留为启用状态，以便该缺陷始终可见。
 
 ## 致谢与许可
 
