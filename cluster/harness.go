@@ -34,6 +34,17 @@ const testHTTPBase = 17600
 // transaction turns ordinary write contention into spurious conflicts.
 const TestLockTTL = time.Second
 
+// TestReplicationTimeout is how long tests wait for every live replica of a group
+// to converge on a state before failing.
+//
+// It is deliberately far longer than any replication or recovery step should take,
+// because none of these waits is a performance assertion. A replica that has not
+// caught up is exhibiting ordinary replication lag; failing on it turns a loaded
+// machine into a spurious failure. That happened repeatedly during stress testing -
+// two replicas held a lock and the third had not applied the entry yet - so the
+// budget is generous and uniform rather than tuned per call site.
+const TestReplicationTimeout = 30 * time.Second
+
 // testPortCursor spaces successive test clusters apart so that a harness which
 // outlives a subtest cannot collide with the next one's ports.
 //

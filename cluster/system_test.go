@@ -132,14 +132,14 @@ func TestMultiGroupAbortLeavesNoTrace(t *testing.T) {
 	}
 	// The locks are now visible in every group...
 	for g := 0; g < 3; g++ {
-		c.WaitForStoreLocks(t, g, 1, 5*time.Second)
+		c.WaitForStoreLocks(t, g, 1, TestReplicationTimeout)
 	}
 	if err := tx.Abort(context.Background()); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
 	// ... and must be gone once it aborts, together with any trace of the values.
 	for g := 0; g < 3; g++ {
-		c.WaitForStoreLocks(t, g, 0, 5*time.Second)
+		c.WaitForStoreLocks(t, g, 0, TestReplicationTimeout)
 		c.MustNotFind(t, txn.Key(fmt.Sprintf("%da", g)))
 	}
 }
@@ -177,7 +177,7 @@ func TestWriteConflictAcrossGroupsAbortsEverything(t *testing.T) {
 	c.MustGet(t, "0a", "winner")
 	c.MustNotFind(t, "1b")
 	for g := 0; g < 2; g++ {
-		c.WaitForStoreLocks(t, g, 0, 5*time.Second)
+		c.WaitForStoreLocks(t, g, 0, TestReplicationTimeout)
 	}
 }
 
@@ -398,7 +398,7 @@ func TestKillGroupLeaderAndContinue(t *testing.T) {
 	}
 
 	// The surviving majority must elect a new leader and keep serving.
-	c.WaitForLeadersT(t, 10*time.Second)
+	c.WaitForLeadersT(t, 30*time.Second)
 	newLeader := c.LeaderOf(0)
 	if newLeader == leader {
 		t.Fatalf("group 0 still reports node %d as leader", leader)
@@ -432,7 +432,7 @@ func TestCrossGroupTransactionSurvivesLeaderCrash(t *testing.T) {
 	if err := c.CrashNode(victimGroup, leader); err != nil {
 		t.Fatalf("crashing leader: %v", err)
 	}
-	c.WaitForLeadersT(t, 10*time.Second)
+	c.WaitForLeadersT(t, 30*time.Second)
 
 	if _, err := c.RunTxn(context.Background(), 20, func(tx *txn.Txn) error {
 		if err := tx.Put("0a", "a1"); err != nil {
@@ -464,7 +464,7 @@ func TestDeadCoordinatorLocksAreRecovered(t *testing.T) {
 	if err := txn.Prewrite(dead); err != nil {
 		t.Fatalf("prewrite: %v", err)
 	}
-	c.WaitForStoreLocks(t, 0, 1, 5*time.Second)
+	c.WaitForStoreLocks(t, 0, 1, TestReplicationTimeout)
 
 	// While the lease is live, reads must block rather than guess: the reader
 	// cannot tell "about to commit" from "gone". A short deadline keeps the test
@@ -488,7 +488,7 @@ func TestDeadCoordinatorLocksAreRecovered(t *testing.T) {
 		t.Fatalf("got (%q, found=%v); want the last committed value", v, found)
 	}
 	for g := 0; g < 2; g++ {
-		c.WaitForStoreLocks(t, g, 0, 5*time.Second)
+		c.WaitForStoreLocks(t, g, 0, TestReplicationTimeout)
 	}
 }
 
@@ -659,8 +659,14 @@ func TestSecondaryLockIsFinishedAfterPrimaryCommits(t *testing.T) {
 	if err := txn.Prewrite(tx); err != nil {
 		t.Fatalf("prewrite: %v", err)
 	}
-	c.WaitForStoreLocks(t, 0, 1, 5*time.Second)
-	c.WaitForStoreLocks(t, 1, 1, 5*time.Second)
+	// Wait for the lock to reach every replica of both groups before sealing.
+	//
+	// The budget is generous on purpose. A lagging follower is ordinary replication
+	// lag, not a missing lock, and a tight timeout here turns a loaded machine into
+	// a spurious failure - which is exactly what happened: two of three replicas had
+	// the lock and the third had not caught up within 5s.
+	c.WaitForStoreLocks(t, 0, 1, TestReplicationTimeout)
+	c.WaitForStoreLocks(t, 1, 1, TestReplicationTimeout)
 
 	// Seal the primary lock. This is the transaction's commit point: from here on
 	// the transaction is committed even though nobody finished it.
@@ -693,7 +699,7 @@ func TestSecondaryLockIsFinishedAfterPrimaryCommits(t *testing.T) {
 		t.Fatalf("primary key: got (%q, found=%v); want A", v, found)
 	}
 	for g := 0; g < 2; g++ {
-		c.WaitForStoreLocks(t, g, 0, 5*time.Second)
+		c.WaitForStoreLocks(t, g, 0, TestReplicationTimeout)
 	}
 }
 
@@ -807,8 +813,8 @@ func TestAtomicityIsPreservedAcrossAPartition(t *testing.T) {
 	if err := txn.Prewrite(tx); err != nil {
 		t.Fatalf("prewrite: %v", err)
 	}
-	c.WaitForStoreLocks(t, 0, 1, 5*time.Second)
-	c.WaitForStoreLocks(t, 1, 1, 5*time.Second)
+	c.WaitForStoreLocks(t, 0, 1, TestReplicationTimeout)
+	c.WaitForStoreLocks(t, 1, 1, TestReplicationTimeout)
 
 	leader0 := c.LeaderOf(0)
 	c.DisconnectNode(0, leader0)
@@ -822,7 +828,15 @@ func TestAtomicityIsPreservedAcrossAPartition(t *testing.T) {
 	t.Logf("commit during the partition returned: %v", commitErr)
 
 	c.ReconnectNode(0, leader0)
-	c.WaitForLeadersT(t, 15*time.Second)
+	// Re-electing takes a while here, and 10s is not enough under load. The
+	// partitioned leader spent the isolation running elections it could not win, so
+	// it comes back with a term far above the rest of the group; its first
+	// AppendEntries then forces the standing leader to step down, and the group has
+	// to elect again. That cascade is normal Raft recovery, and how long it takes
+	// depends on how busy the machine is - not on anything this test is asserting.
+	// The budget is therefore generous: this test is about atomicity across a
+	// partition, not about election latency.
+	c.WaitForLeadersT(t, 45*time.Second)
 
 	// Whatever happened, the two groups must agree: either both keys exist or
 	// neither does. Never one without the other. Reads retry, because the

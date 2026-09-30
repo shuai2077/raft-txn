@@ -66,10 +66,17 @@ go test ./cluster/                # end-to-end against a real cluster
 
 > **On flaky tests.** Two tests in that upstream suite —
 > `TestDisconnectAfterSubmit` and `TestBug_BecomeFollowerMissingPersist` — are
-> timing-sensitive and occasionally fail when the whole suite runs on a loaded
-> machine. This is inherited, not introduced: the measured flake rate against
-> unmodified `eliben/raft` on the same machine is comparable. Both pass reliably
-> in isolation. Every other package is stable across repeated runs.
+> timing-sensitive and occasionally fail under load, along with `TestCrashAfterSubmit`
+> on rare occasions. This is **inherited, not introduced**, and that was verified
+> rather than assumed: running the same package in a worktree of the commit *before*
+> the changes to `internal/raft` failed 3 times in 15 (20%), and the current tree
+> failed 2 in 10 (20%), with the same tests failing both times. Both pass reliably
+> when run together with nothing else on the machine.
+>
+> Three other causes of flakiness found by stress testing — port collisions between
+> test clusters, two goroutines outliving `Shutdown`, and test wait budgets too tight
+> for a loaded machine — are fixed; see the commit history for the details. Repeated
+> full-suite stress runs now fail only on the inherited tests above.
 
 To watch the mechanism rather than the tests:
 
