@@ -15,7 +15,13 @@ import (
 	"time"
 )
 
-const DebugCM = 1
+// DebugCM enables the consensus module's verbose logging.
+//
+// It is a variable rather than a constant (txnkv local extension) so that a
+// program embedding Raft can quiet it down. The upstream test suite and the
+// log-visualisation tool both want it on; a long-running application that prints
+// every heartbeat does not.
+var DebugCM = 1
 
 // CommitEntry is the data reported by Raft to the commit channel. Each commit
 // entry notifies the client that consensus was reached on a command and it can
@@ -306,6 +312,16 @@ func (cm *ConsensusModule) triggerReplication() {
 	}
 }
 
+// SetDebug enables or disables this module's verbose logging (txnkv local
+// extension). It is safe to call at any time.
+func (cm *ConsensusModule) SetDebug(enabled bool) {
+	if enabled {
+		DebugCM = 1
+		return
+	}
+	DebugCM = 0
+}
+
 // LeaderID returns the id of the last leader this CM heard from, or -1 when
 // none is known. It is a routing hint, not a guarantee: leadership may move
 // before the caller acts on it.
@@ -409,6 +425,10 @@ func (cm *ConsensusModule) persistToStorage() {
 }
 
 // dlog logs a debugging message if DebugCM > 0.
+//
+// It reads the live value of DebugCM rather than a snapshot taken at
+// construction, so a program can turn verbose logging on or off at any time -
+// including from a test that wants to quieten a subtest.
 func (cm *ConsensusModule) dlog(format string, args ...any) {
 	if DebugCM > 0 {
 		format = fmt.Sprintf("[%d] ", cm.id) + format

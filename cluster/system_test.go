@@ -25,7 +25,7 @@ func testCluster(t *testing.T, groups int) *Cluster {
 
 func TestClusterStartsAndServes(t *testing.T) {
 	c := testCluster(t, 3)
-	c.DumpTopology(t)
+	c.DumpTopologyT(t)
 
 	if c.TSOLeader() < 0 {
 		t.Fatal("timestamp oracle has no leader")
@@ -41,11 +41,11 @@ func TestSingleKeyLifecycle(t *testing.T) {
 	c := testCluster(t, 2)
 
 	c.MustNotFind(t, "0a")
-	c.Put(t, "0a", "first")
+	c.PutT(t, "0a", "first")
 	c.MustGet(t, "0a", "first")
-	c.Put(t, "0a", "second")
+	c.PutT(t, "0a", "second")
 	c.MustGet(t, "0a", "second")
-	c.Delete(t, "0a")
+	c.DeleteT(t, "0a")
 	c.MustNotFind(t, "0a")
 }
 
@@ -55,7 +55,7 @@ func TestRuntimeIsolatedFromRaftCore(t *testing.T) {
 	// commit channel is not being drained and Raft has stalled.
 	c := testCluster(t, 1)
 	for i := 0; i < 8; i++ {
-		c.Put(t, txn.Key(fmt.Sprintf("0key%d", i)), txn.Value(fmt.Sprintf("v%d", i)))
+		c.PutT(t, txn.Key(fmt.Sprintf("0key%d", i)), txn.Value(fmt.Sprintf("v%d", i)))
 	}
 	for i := 0; i < 8; i++ {
 		c.MustGet(t, txn.Key(fmt.Sprintf("0key%d", i)), txn.Value(fmt.Sprintf("v%d", i)))
@@ -139,7 +139,7 @@ func TestMultiGroupAbortLeavesNoTrace(t *testing.T) {
 func TestWriteConflictAcrossGroupsAbortsEverything(t *testing.T) {
 	c := testCluster(t, 2)
 
-	c.Put(t, "0a", "seed")
+	c.PutT(t, "0a", "seed")
 
 	// T takes a snapshot and writes keys in both groups.
 	tx, err := c.Client().Begin(context.Background())
@@ -154,7 +154,7 @@ func TestWriteConflictAcrossGroupsAbortsEverything(t *testing.T) {
 	}
 
 	// Somebody else wins the race on 0a.
-	c.Put(t, "0a", "winner")
+	c.PutT(t, "0a", "winner")
 
 	_, err = tx.Commit(context.Background())
 	if err == nil {
@@ -181,8 +181,8 @@ func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 	const accounts = 2
 	const start = 100
 	keys := []txn.Key{"0alice", "1bob"}
-	c.Put(t, keys[0], "100")
-	c.Put(t, keys[1], "100")
+	c.PutT(t, keys[0], "100")
+	c.PutT(t, keys[1], "100")
 
 	var wg sync.WaitGroup
 	workers := 4
@@ -263,8 +263,8 @@ func mustParse(t *testing.T, s string) int64 {
 func TestSnapshotIsolationIsRepeatable(t *testing.T) {
 	c := testCluster(t, 2)
 
-	c.Put(t, "0a", "a0")
-	c.Put(t, "1b", "b0")
+	c.PutT(t, "0a", "a0")
+	c.PutT(t, "1b", "b0")
 
 	// The long reader takes one snapshot for everything it reads.
 	long, err := c.Client().Begin(context.Background())
@@ -277,8 +277,8 @@ func TestSnapshotIsolationIsRepeatable(t *testing.T) {
 
 	// Several committed updates land after the snapshot.
 	for i := 1; i <= 3; i++ {
-		c.Put(t, "0a", txn.Value(fmt.Sprintf("a%d", i)))
-		c.Put(t, "1b", txn.Value(fmt.Sprintf("b%d", i)))
+		c.PutT(t, "0a", txn.Value(fmt.Sprintf("a%d", i)))
+		c.PutT(t, "1b", txn.Value(fmt.Sprintf("b%d", i)))
 	}
 
 	// The long reader still sees its own snapshot, on both groups.
@@ -306,7 +306,7 @@ func get(t *testing.T, tx *txn.Txn, key txn.Key) (txn.Value, bool) {
 func TestKillGroupLeaderAndContinue(t *testing.T) {
 	c := testCluster(t, 2)
 
-	c.Put(t, "0a", "before")
+	c.PutT(t, "0a", "before")
 	leader := c.LeaderOf(0)
 	if leader < 0 {
 		t.Fatal("group 0 has no leader")
@@ -323,7 +323,7 @@ func TestKillGroupLeaderAndContinue(t *testing.T) {
 		t.Fatalf("group 0 still reports node %d as leader", leader)
 	}
 	c.MustGet(t, "0a", "before")
-	c.Put(t, "0a", "after")
+	c.PutT(t, "0a", "after")
 	c.MustGet(t, "0a", "after")
 
 	// Restarting the old leader must catch it up from its own log, not from a
@@ -339,8 +339,8 @@ func TestKillGroupLeaderAndContinue(t *testing.T) {
 func TestCrossGroupTransactionSurvivesLeaderCrash(t *testing.T) {
 	c := testCluster(t, 2)
 
-	c.Put(t, "0a", "a0")
-	c.Put(t, "1b", "b0")
+	c.PutT(t, "0a", "a0")
+	c.PutT(t, "1b", "b0")
 
 	// Crash one group's leader, then run a transaction spanning both groups.
 	victimGroup := 1
@@ -368,7 +368,7 @@ func TestCrossGroupTransactionSurvivesLeaderCrash(t *testing.T) {
 func TestDeadCoordinatorLocksAreRecovered(t *testing.T) {
 	c := testCluster(t, 2)
 
-	c.Put(t, "0a", "committed")
+	c.PutT(t, "0a", "committed")
 
 	// A transaction prepares and then its coordinator disappears: the locks are
 	// left behind with no decision. Simulate that by prewriting and dropping the
@@ -402,7 +402,7 @@ func TestDeadCoordinatorLocksAreRecovered(t *testing.T) {
 	// Once the lease lapses, a reader reclaims the lock and sees the last
 	// committed value rather than the dead transaction's value. The zombie's
 	// value must never appear.
-	v, found := c.WaitForRead(t, "0a", 5*time.Second)
+	v, found := mustWaitForRead(c, t, "0a", 5*time.Second)
 	if !found || v != "committed" {
 		t.Fatalf("got (%q, found=%v); want the last committed value", v, found)
 	}
@@ -416,7 +416,7 @@ func TestCommittedDataSurvivesFullClusterRestart(t *testing.T) {
 
 	for g := 0; g < 2; g++ {
 		for i := 0; i < 3; i++ {
-			c.Put(t, txn.Key(fmt.Sprintf("%dkey%d", g, i)), txn.Value(fmt.Sprintf("value-%d-%d", g, i)))
+			c.PutT(t, txn.Key(fmt.Sprintf("%dkey%d", g, i)), txn.Value(fmt.Sprintf("value-%d-%d", g, i)))
 		}
 	}
 
@@ -444,14 +444,14 @@ func TestCommittedDataSurvivesFullClusterRestart(t *testing.T) {
 		}
 	}
 	// And the cluster still accepts writes.
-	c.Put(t, "0new", "after-restart")
+	c.PutT(t, "0new", "after-restart")
 	c.MustGet(t, "0new", "after-restart")
 }
 
 func TestMinorityPartitionCannotCommit(t *testing.T) {
 	c := testCluster(t, 1)
 
-	c.Put(t, "0a", "before")
+	c.PutT(t, "0a", "before")
 
 	// Isolate one follower and then the leader, leaving a minority of one.
 	leader := c.LeaderOf(0)
@@ -540,7 +540,7 @@ func TestTimestampOracleSurvivesLeaderChange(t *testing.T) {
 func TestWritesContinueAcrossOracleFailover(t *testing.T) {
 	c := testCluster(t, 2)
 
-	c.Put(t, "0a", "v0")
+	c.PutT(t, "0a", "v0")
 	leader := c.TSOLeader()
 	if err := c.CrashTSO(leader); err != nil {
 		t.Fatalf("crashing oracle leader: %v", err)
@@ -591,7 +591,7 @@ func TestSecondaryLockIsFinishedAfterPrimaryCommits(t *testing.T) {
 	if leader0 < 0 {
 		t.Fatal("group 0 has no leader")
 	}
-	c.SealPrimary(t, tx, primary, 0, leader0)
+	c.SealPrimaryT(t, tx, primary, 0, leader0)
 
 	// A reader that trips over the secondary lock must finish it rather than
 	// discard it. Losing it would mean losing an acknowledged write.
@@ -746,8 +746,8 @@ func TestAtomicityIsPreservedAcrossAPartition(t *testing.T) {
 	// Whatever happened, the two groups must agree: either both keys exist or
 	// neither does. Never one without the other. Reads retry, because the
 	// transaction's locks may still be within their lease.
-	_, foundA := c.WaitForRead(t, "0a", 10*time.Second)
-	_, foundB := c.WaitForRead(t, "1b", 10*time.Second)
+	_, foundA := mustWaitForRead(c, t, "0a", 10*time.Second)
+	_, foundB := mustWaitForRead(c, t, "1b", 10*time.Second)
 	if foundA != foundB {
 		t.Fatalf("atomicity violated after a partition: 0a present=%v, 1b present=%v", foundA, foundB)
 	}
@@ -762,7 +762,7 @@ func TestManyKeysAcrossGroups(t *testing.T) {
 	const keys = 30
 	for i := 0; i < keys; i++ {
 		key := txn.Key(fmt.Sprintf("%dkey%02d", i%3, i))
-		c.Put(t, key, txn.Value(fmt.Sprintf("value%02d", i)))
+		c.PutT(t, key, txn.Value(fmt.Sprintf("value%02d", i)))
 	}
 	for i := 0; i < keys; i++ {
 		key := txn.Key(fmt.Sprintf("%dkey%02d", i%3, i))
@@ -785,7 +785,7 @@ func TestManyKeysAcrossGroups(t *testing.T) {
 func TestErrorsAreTyped(t *testing.T) {
 	c := testCluster(t, 1)
 
-	c.Put(t, "0a", "v")
+	c.PutT(t, "0a", "v")
 
 	// A conflicting transaction must produce a typed conflict, not a stringly
 	// typed error: applications branch on this, and matching on text would be

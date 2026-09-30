@@ -488,6 +488,9 @@ func (c *Cluster) Shutdown() {
 
 // --- helpers -----------------------------------------------------------------
 
+// contextBackground is the default context for the harness's convenience calls.
+func contextBackground() context.Context { return context.Background() }
+
 func idsExcept(n, except int) []int {
 	out := make([]int, 0, n)
 	for i := 0; i < n; i++ {

@@ -155,6 +155,13 @@ func (n *Node) Store() *txn.Store { return n.store }
 // machine directly. Tests use it to build a coordinator without HTTP.
 func (n *Node) Participant() txn.Participant { return n.log }
 
+// SetRaftLogging turns the group's Raft verbose logging on or off.
+//
+// The switch is global to the process (upstream exposes it as a package-level
+// flag), so this is a coarse control: it is meant for a program that embeds the
+// store and does not want a log line per heartbeat.
+func (n *Node) SetRaftLogging(enabled bool) { n.raftServer.SetDebug(enabled) }
+
 // RaftListenAddr returns the address of this node's Raft peer RPC listener.
 func (n *Node) RaftListenAddr() net.Addr { return n.raftServer.GetListenAddr() }
 

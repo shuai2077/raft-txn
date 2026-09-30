@@ -243,6 +243,19 @@ func (s *Server) Apply(cmd any) (any, error) {
 	}
 }
 
+// SetDebug enables or disables the Raft logging for this server (txnkv local
+// extension). An embedding application that does not want a line per heartbeat
+// turns it off; the upstream tests leave it on.
+func (s *Server) SetDebug(enabled bool) {
+	s.mu.Lock()
+	cm := s.cm
+	s.mu.Unlock()
+	if cm == nil {
+		return
+	}
+	cm.SetDebug(enabled)
+}
+
 // NotLeaderError reports that a command was submitted to a replica that is not
 // the leader of its Raft group. LeaderID carries a routing hint, or -1 when this
 // node does not know who the leader is.
