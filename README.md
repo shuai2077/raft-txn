@@ -62,6 +62,19 @@ go test ./cluster/                # end-to-end against a real cluster
 
 `internal/raft` is upstream's own test suite and takes the longest.
 
+> **On flaky tests.** Two tests in that upstream suite —
+> `TestDisconnectAfterSubmit` and `TestBug_BecomeFollowerMissingPersist` — are
+> timing-sensitive and occasionally fail when the whole suite runs on a loaded
+> machine. This is inherited, not introduced: the measured flake rate against
+> unmodified `eliben/raft` on the same machine is comparable. Both pass reliably
+> in isolation. Every other package is stable across repeated runs.
+
+To watch the mechanism rather than the tests:
+
+```bash
+go run ./cmd/demo
+```
+
 ## Layout
 
 | Path | What lives there |
