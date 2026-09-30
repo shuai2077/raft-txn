@@ -235,17 +235,30 @@ func (c *Cluster) SetRaftLogging(enabled bool) {
 
 // DumpTopology renders the cluster's leader layout. It is invaluable when a
 // distributed test fails, and useful when watching a demo run.
+//
+// The labels describe each member's role, not only its health:
+//
+//	crashed      deliberately stopped
+//	partitioned  alive but disconnected from its peers
+//	LEADER       the group's current leader
+//	follower     up, connected, and simply not the leader
+//
+// "follower" is not a decorative case. Without it every healthy follower fell
+// through to a "down" default, so a perfectly healthy cluster printed as one
+// leader and two "down" members per group - which is alarming, and wrong.
 func (c *Cluster) DumpTopology() []string {
 	out := make([]string, 0, c.cfg.NumGroups+1)
 	for g := 0; g < c.cfg.NumGroups; g++ {
 		line := fmt.Sprintf("group %d:", g)
 		for n := 0; n < c.cfg.NodesPerGroup; n++ {
-			state := "down"
+			state := "follower"
 			switch {
 			case !c.alive[g][n]:
 				state = "crashed"
 			case !c.connected[g][n]:
 				state = "partitioned"
+			case c.nodes[g][n] == nil:
+				state = "down"
 			case c.nodes[g][n].IsLeader():
 				state = "LEADER"
 			}
@@ -255,12 +268,14 @@ func (c *Cluster) DumpTopology() []string {
 	}
 	line := "tso:"
 	for i := range c.tsoNodes {
-		state := "down"
+		state := "follower"
 		switch {
 		case !c.tsoAlive[i]:
 			state = "crashed"
 		case !c.tsoConnected[i]:
 			state = "partitioned"
+		case c.tsoNodes[i] == nil:
+			state = "down"
 		case c.tsoNodes[i].IsLeader():
 			state = "LEADER"
 		}
