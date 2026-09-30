@@ -8,6 +8,8 @@ Upstream Raft makes **one command** atomic. This repository makes **a set of
 writes across several Raft groups** atomic, isolated, and durable — which is what
 it takes to build a database rather than a replicated log.
 
+> 中文版：[README.zh-CN.md](README.zh-CN.md)
+
 ```
    N transaction groups (shards)              1 replicated timestamp oracle
    ┌─────────┐ ┌─────────┐ ┌─────────┐        ┌─────────┐
@@ -86,6 +88,7 @@ go run ./cmd/demo
 | `cluster/` | Wiring for a whole Multi-Raft cluster, plus fault injection |
 | `docs/` | [Raft analysis](docs/01-raft-analysis.md) · [transaction design](docs/02-transaction-design.md) |
 | `cmd/demo/` | A runnable demonstration |
+| `README.zh-CN.md` | This README in Chinese |
 
 ## How it works, in one page
 
