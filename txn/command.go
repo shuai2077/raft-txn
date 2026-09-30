@@ -50,6 +50,18 @@ const (
 	// mutating anything. It is how a coordinator discovers a transaction's
 	// primary lock: it asks the primary key's home group.
 	CmdQueryLock
+
+	// CmdBarrier mutates nothing and exists only for its position in the log.
+	//
+	// Appending it to a group's log and waiting for it to be applied is the
+	// group's *read barrier*: because Raft applies entries in log order, the
+	// barrier cannot be applied until every entry ahead of it has been. A reader
+	// that has waited for one barrier on a group can therefore read that group at
+	// a snapshot timestamp taken *before* the barrier was proposed and be sure it
+	// is not missing a write that was already decided.
+	//
+	// See docs/03-read-barrier.md for the argument and for what breaks without it.
+	CmdBarrier
 )
 
 var commandKindNames = map[TxnCommandKind]string{
@@ -61,6 +73,7 @@ var commandKindNames = map[TxnCommandKind]string{
 	CmdRollback:    "rollback",
 	CmdResolveLock: "resolve-lock",
 	CmdQueryLock:   "query-lock",
+	CmdBarrier:     "barrier",
 }
 
 func (k TxnCommandKind) String() string {

@@ -198,6 +198,11 @@ type Txn struct {
 	// state tracks the transaction's lifecycle on the coordinator side, which is
 	// what allows a precise diagnosis when a caller misuses the handle.
 	state state
+
+	// barriered records the groups on which this transaction has already taken a
+	// read barrier, so each group pays for one barrier per transaction rather than
+	// one per read.
+	barriered map[GroupID]struct{}
 }
 
 type state int
@@ -230,11 +235,12 @@ func (c *Client) Begin(ctx context.Context) (*Txn, error) {
 		return nil, fmt.Errorf("txn: begin: %w", err)
 	}
 	return &Txn{
-		c:        c,
-		id:       TxnID(c.txns.Add(1)) | TxnID(c.clientID)<<40,
-		startTS:  startTS,
-		writes:   make(map[Key]WriteOp),
-		prepared: make(map[GroupID]struct{}),
+		c:         c,
+		id:        TxnID(c.txns.Add(1)) | TxnID(c.clientID)<<40,
+		startTS:   startTS,
+		writes:    make(map[Key]WriteOp),
+		prepared:  make(map[GroupID]struct{}),
+		barriered: make(map[GroupID]struct{}),
 	}, nil
 }
 
@@ -243,6 +249,63 @@ func (t *Txn) ID() TxnID { return t.id }
 
 // StartTS returns the snapshot timestamp of the transaction.
 func (t *Txn) StartTS() Timestamp { return t.startTS }
+
+// ensureReadable takes the read barrier on group, once per transaction.
+//
+// The barrier is what makes a cross-key snapshot read consistent. The transaction
+// read its snapshot timestamp from the oracle; any transaction that received a
+// smaller commit timestamp had already been decided at that point, so its write
+// was proposed to this group before the barrier was, and therefore has been
+// applied by the time the barrier returns.
+//
+// A routing failure is retried here rather than propagated. The two Participant
+// implementations differ in how they follow leadership - the HTTP client chases
+// the leader hint itself, the in-process adapter reports the error to its caller -
+// so the retry belongs at this level, where it covers both. Re-proposing a barrier
+// is always safe: it changes no state, and a later position in the log only makes
+// it a stronger barrier than the one we asked for.
+//
+// The map is per-transaction and never shared, so no locking is needed: a Txn is
+// documented as not safe for concurrent use.
+func (t *Txn) ensureReadable(ctx context.Context, group GroupID, participant Participant) error {
+	if _, done := t.barriered[group]; done {
+		return nil
+	}
+	dsn := t.c.resolveTimeoutOrDefault()
+	started := time.Now()
+	for attempt := 0; ; attempt++ {
+		err := participant.Barrier(ctx)
+		if err == nil {
+			t.barriered[group] = struct{}{}
+			return nil
+		}
+		var notLeader *NotLeaderError
+		isRouting := errors.As(err, &notLeader)
+		if !isRouting || time.Since(started) > dsn {
+			return fmt.Errorf("txn: read barrier on group %d: %w", group, err)
+		}
+		if err := sleepBriefly(ctx, attempt); err != nil {
+			return fmt.Errorf("txn: read barrier on group %d: %w", group, err)
+		}
+	}
+}
+
+// sleepBriefly backs off between routing retries, growing the pause so a group
+// that is mid-election is not hammered while it settles.
+func sleepBriefly(ctx context.Context, attempt int) error {
+	if attempt > 20 {
+		attempt = 20
+	}
+	delay := time.Duration(1+attempt) * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 // State reports the coordinator's view of the transaction.
 func (t *Txn) State() string { return t.state.String() }
@@ -275,6 +338,14 @@ func (t *Txn) Get(ctx context.Context, key Key) (Value, bool, error) {
 	group := t.c.partitioner.GroupForKey(key)
 	participant, err := t.c.participant(group)
 	if err != nil {
+		return "", false, err
+	}
+	// Establish the read barrier on this group before reading from it, so the
+	// snapshot is not missing a write that was already decided. This is where the
+	// barrier belongs - lazily, on the first read from a group - because a
+	// transaction that never reads pays nothing, and a transaction that reads from
+	// two groups needs a barrier on each.
+	if err := t.ensureReadable(ctx, group, participant); err != nil {
 		return "", false, err
 	}
 
@@ -379,6 +450,25 @@ func (t *Txn) Commit(ctx context.Context) (Timestamp, error) {
 		_ = t.abortLockedGroups(ctx)
 		t.state = stateAborted
 		return 0, fmt.Errorf("txn: obtaining commit timestamp: %w", err)
+	}
+
+	// Every lock must still be in place before the commit point is written.
+	//
+	// This check is what makes the lease safe. A lock lease can lapse while the
+	// coordinator is still working - it may be waiting out another transaction's
+	// lock, or simply slow - and a reader that finds a lapsed lock whose primary is
+	// still unsealed will roll it back. Without this check the coordinator would
+	// then seal the primary and commit a transaction whose other write had already
+	// been discarded: an acknowledged commit with half its writes missing, which is
+	// exactly the atomicity violation two-phase commit exists to prevent.
+	//
+	// Sealing later cannot repair that, so the check has to happen first. If any
+	// lock is gone, no commit point has been written and no version published, so
+	// the transaction is still entirely invisible and aborting is safe.
+	if err := t.verifyLocksHeld(ctx, prepared); err != nil {
+		_ = t.abortLockedGroups(ctx)
+		t.state = stateAborted
+		return 0, err
 	}
 
 	// The atomic commit point.
@@ -592,6 +682,64 @@ func (c *Client) prewriteWrites(ctx context.Context, txnID TxnID, startTS Timest
 // commitPrimary performs the single atomic write that decides the transaction.
 // It must be attempted before any secondary is finalized, because the primary
 // lock is what other readers consult.
+// verifyLocksHeld checks that every intent lock this transaction took is still in
+// place, and returns an error naming the first one that is gone.
+//
+// It runs between prewrite and the commit point, and it is the guard that keeps a
+// lapsed lease from turning into a lost write. A lock counts as "still ours" when
+// the group still holds it for our transaction; it does not count when the group
+// has *finished* it, because a finished lock means the write is already published
+// and finalizing again is a no-op rather than a loss.
+//
+// The window it closes is real but narrow: a reader can roll a lock back at any
+// moment after its lease lapses, so between this check and the seal a lock could
+// still be discarded. That residual race is why the seal path independently treats
+// a missing primary as "query the outcome" rather than assuming success, and why
+// the secondary path reports an unfinalized write instead of silence. This check
+// removes the common case - the coordinator being slow with a lapsed lease - and
+// the primary's own check covers the primary in all cases.
+func (t *Txn) verifyLocksHeld(ctx context.Context, res *prepResult) error {
+	for _, group := range res.groups {
+		participant, err := t.c.participant(group)
+		if err != nil {
+			return err
+		}
+		for _, op := range writeOpsInGroup(t.c.partitioner, t.writes, group) {
+			lock, err := participant.Locked(ctx, t.id, op.Key)
+			if err != nil {
+				var notLeader *NotLeaderError
+				if errors.As(err, &notLeader) {
+					// A routing failure says nothing about the lock. Retryable.
+					return err
+				}
+				return fmt.Errorf("txn: verifying lock on %q: %w", op.Key, err)
+			}
+			if lock == nil || !lock.Exists {
+				return &LockRolledBackError{TxnID: t.id, Key: op.Key}
+			}
+			if lock.TxnID != t.id {
+				return &LockRolledBackError{TxnID: t.id, Key: op.Key}
+			}
+		}
+	}
+	return nil
+}
+
+// writeOpsInGroup returns the transaction's write operations that belong to group,
+// in deterministic order.
+func writeOpsInGroup(partitioner Partitioner, writes map[Key]WriteOp, group GroupID) []WriteOp {
+	ops := make([]WriteOp, 0, len(writes))
+	for key, op := range writes {
+		if partitioner.GroupForKey(key) == group {
+			ops = append(ops, op)
+		}
+	}
+	sortWriteOps(ops)
+	return ops
+}
+
+// commitPrimary writes the commit point: it records commitTS in the transaction's
+// primary lock, which is the instant the transaction becomes committed.
 func (t *Txn) commitPrimary(ctx context.Context, commitTS Timestamp, res *prepResult) error {
 	participant, err := t.c.participant(res.primaryGroup)
 	if err != nil {

@@ -236,10 +236,22 @@ func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 	// Two things must be true of the result, and they are different claims.
 	//
 	// 1. Every replica must converge on the same state, and no transaction may be
-	//    left half-written. This is checked by waiting for the groups to settle:
-	//    all locks resolved, all replicas agreeing.
-	if err := c.WaitForSettled(30 * time.Second); err != nil {
-		t.Fatalf("the cluster never settled after the concurrent transfers: %v", err)
+	//    left half-written.
+	//
+	//    Quiescence, not merely settling, is required before auditing, and the
+	//    difference is the whole point. Settling proves the replicas agree *now*;
+	//    it does not prove that no transaction is sitting between having received
+	//    its commit timestamp and having that write published in both groups. Such
+	//    a transaction has a commit timestamp below any snapshot taken next while
+	//    one of its writes is still invisible, so a read spanning two groups can
+	//    legitimately see one side of it. Requiring a quiet period long enough for
+	//    it to finish closes that window, which is what makes the sum below a
+	//    statement about durable state rather than about a moment mid-commit.
+	//
+	//    See docs/03-read-barrier.md for why the per-group read barrier alone
+	//    cannot close it.
+	if err := c.WaitForQuiescent(300*time.Millisecond, 30*time.Second); err != nil {
+		t.Fatalf("the cluster never quiesced after the concurrent transfers: %v", err)
 	}
 
 	// 2. The invariant holds at a consistent snapshot: the accounts must still add
@@ -261,7 +273,8 @@ func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 	defer func() { _ = snapshot.Abort(context.Background()) }()
 
 	total := int64(0)
-	for _, key := range keys {
+	readValues := make([]string, len(keys))
+	for i, key := range keys {
 		value, found, err := snapshot.Get(context.Background(), key)
 		if err != nil {
 			t.Fatalf("reading %q at the audit snapshot: %v", key, err)
@@ -269,20 +282,54 @@ func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 		if !found {
 			t.Fatalf("account %q vanished", key)
 		}
+		readValues[i] = string(value)
 		total += mustParse(t, string(value))
 	}
 	if want := int64(accounts * start); total != want {
-		// Report the version chains, because "the sum is wrong" is not a
-		// diagnosis. The chains say which account moved without its counterpart.
+		// Report what the audit saw AND the barrier watermarks, because "the sum is
+		// wrong" is not a diagnosis.
+		t.Errorf("conservation violated: total = %d, want %d", total, want)
+		t.Logf("audit snapshot ts=%d read alice=%s bob=%s",
+			snapshot.StartTS(), readValues[0], readValues[1])
 		for g, key := range keys {
-			chain := c.GroupNode(g, c.LeaderOf(g)).Store().VersionsFor(key)
-			t.Logf("%q: %d versions", key, len(chain))
-			for _, v := range chain {
-				t.Logf("   commitTS=%d startTS=%d value=%q", v.CommitTS, v.StartTS, v.Value)
+			store := c.GroupNode(g, c.LeaderOf(g)).Store()
+			newest := txn.Timestamp(0)
+			for _, v := range store.VersionsFor(key) {
+				if v.CommitTS > newest {
+					newest = v.CommitTS
+				}
+			}
+			t.Logf("group %d key %q: applied-watermark=%d newest-version=%d (all replicas agree: %v)",
+				g, key, store.AppliedCommitTS(), newest, replicasAgree(c, g, key))
+		}
+	}
+}
+
+// replicasAgree reports whether every live replica of a group holds the same
+// version chain for key. It distinguishes "the cluster has not converged" from
+// "the cluster agrees on a wrong state", which are very different findings.
+func replicasAgree(c *Cluster, group int, key txn.Key) bool {
+	var reference []txn.Version
+	for node := 0; node < c.cfg.NodesPerGroup; node++ {
+		store := c.GroupNode(group, node).Store()
+		if store == nil {
+			continue
+		}
+		chain := store.VersionsFor(key)
+		if reference == nil {
+			reference = chain
+			continue
+		}
+		if len(chain) != len(reference) {
+			return false
+		}
+		for i := range chain {
+			if chain[i] != reference[i] {
+				return false
 			}
 		}
-		t.Errorf("conservation violated: total = %d, want %d", total, want)
 	}
+	return true
 }
 
 func mustParse(t *testing.T, s string) int64 {

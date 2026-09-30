@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -215,6 +216,81 @@ func (c *Cluster) settled() error {
 		}
 	}
 	return nil
+}
+
+// Barrier takes a read barrier on one group and returns the group's applied
+// commit-timestamp watermark once the barrier has been applied.
+//
+// The watermark is the observability half of the barrier's guarantee: a reader
+// that has taken a barrier can check that the group has already applied every
+// commit timestamp it is about to read at. See docs/03-read-barrier.md.
+func (c *Cluster) Barrier(group int) (txn.Timestamp, error) {
+	return c.BarrierCtx(context.Background(), group)
+}
+
+// BarrierCtx is Barrier with a caller-supplied context.
+func (c *Cluster) BarrierCtx(ctx context.Context, group int) (txn.Timestamp, error) {
+	participant, err := c.clients.ParticipantFor(txn.GroupID(group))
+	if err != nil {
+		return 0, err
+	}
+	if err := participant.Barrier(ctx); err != nil {
+		return 0, fmt.Errorf("barrier on group %d: %w", group, err)
+	}
+	return c.GroupNode(group, c.LeaderOf(group)).Store().AppliedCommitTS(), nil
+}
+
+// Barriers takes a read barrier on every group, which is what a transaction that
+// reads across all of them needs. It returns the lowest watermark observed, so a
+// caller can assert the whole cluster has reached it.
+func (c *Cluster) Barriers() (txn.Timestamp, error) {
+	lowest := txn.Timestamp(0)
+	for g := 0; g < c.NumGroups(); g++ {
+		watermark, err := c.Barrier(g)
+		if err != nil {
+			return 0, err
+		}
+		if g == 0 || watermark < lowest {
+			lowest = watermark
+		}
+	}
+	return lowest, nil
+}
+
+// WaitForQuiescent blocks until the cluster has been settled continuously for
+// `stable`, then returns.
+//
+// This is stronger than WaitForSettled, and the difference is exactly the read
+// barrier's remaining gap. Settling proves every replica agrees *now*; it does not
+// prove that no transaction is sitting between having received its commit
+// timestamp and having that write applied in every group. A transaction in that
+// window has a commit timestamp below any snapshot taken next, yet part of it is
+// invisible - so a read-only transaction spanning two groups can see one side of
+// it. Requiring a quiet period long enough for such a transaction to finish closes
+// that window, which is what a cross-key conservation check needs.
+//
+// See docs/03-read-barrier.md for why the per-group barrier alone cannot close it.
+func (c *Cluster) WaitForQuiescent(stable, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	quietSince := time.Time{}
+	var lastErr error
+	for {
+		if err := c.settled(); err != nil {
+			lastErr = err
+			quietSince = time.Time{}
+		} else if quietSince.IsZero() {
+			quietSince = time.Now()
+		} else if time.Since(quietSince) >= stable {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("cluster was never quiet for %s within %s: %w", stable, timeout, lastErr)
+			}
+			return fmt.Errorf("cluster was never quiet for %s within %s", stable, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // SetRaftLogging turns the verbose Raft logging of every member on or off.

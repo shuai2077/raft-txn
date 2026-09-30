@@ -11,9 +11,61 @@ import (
 // snapshot reads, isolation, conflict handling and recovery from a coordinator
 // that dies mid-commit.
 
-// readCommitted reads a key at "now" straight out of one group's state machine,
-// bypassing the transaction client. It is how tests observe what a group really
-// stores.
+// TestVerifyLocksHeldRefusesAMissingSecondaryLock tests the guard that stops a
+// lapsed lease from becoming a lost write.
+//
+// It is a unit test of the check itself, which is where the guarantee lives: the
+// end-to-end scenario can be caught earlier by a different guard, but this pins
+// the behaviour the coordinator depends on - if any intent lock is gone before the
+// commit point is written, the commit must be refused with a
+// LockRolledBackError rather than proceeding.
+func TestVerifyLocksHeldRefusesAMissingSecondaryLock(t *testing.T) {
+	tc := newTestCluster(t, groupForPrefix{}, 2)
+
+	tx := tc.Begin()
+	tc.MustPut(tx, "0a", "A")
+	tc.MustPut(tx, "1b", "B")
+
+	prep, err := tc.client.prewriteWrites(context.Background(), tx.id, tx.startTS, tx.writes)
+	if err != nil {
+		t.Fatalf("prewrite: %v", err)
+	}
+	if len(prep.groups) != 2 {
+		t.Fatalf("prepared %d groups, want 2", len(prep.groups))
+	}
+
+	// With both locks in place the check passes.
+	if err := tx.verifyLocksHeld(context.Background(), prep); err != nil {
+		t.Fatalf("verify with both locks held: %v", err)
+	}
+
+	// Discard the secondary lock, as a reader does to a lapsed one whose primary is
+	// still unsealed.
+	secondary := GroupID(1)
+	if err := tc.groups[secondary].Rollback(context.Background(), RollbackRequest{
+		TxnID: tx.id, ClientID: tc.client.clientID, RequestID: 99,
+		StartTS: tx.startTS, Keys: []Key{"1b"},
+	}); err != nil {
+		t.Fatalf("rolling back the secondary lock: %v", err)
+	}
+
+	// The check must now fail and name the key that is gone.
+	err = tx.verifyLocksHeld(context.Background(), prep)
+	if err == nil {
+		t.Fatal("verify passed although the secondary lock was gone")
+	}
+	var rolledBack *LockRolledBackError
+	if !errors.As(err, &rolledBack) {
+		t.Fatalf("got %v; want a LockRolledBackError", err)
+	}
+	if rolledBack.Key != "1b" {
+		t.Errorf("the error names key %q; want %q", rolledBack.Key, "1b")
+	}
+	if rolledBack.TxnID != tx.id {
+		t.Errorf("the error names txn %d; want %d", rolledBack.TxnID, tx.id)
+	}
+}
+
 // readCommitted reads a key at "now" straight out of one group's state machine,
 // bypassing the transaction client. It is how tests observe what a group really
 // stores.

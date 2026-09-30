@@ -106,6 +106,17 @@ type Store struct {
 	versions map[Key][]Version
 	locks    map[Key]*LockRecord
 	actors   map[TxnID]*Actor
+
+	// appliedCommitTS is the highest commit timestamp this state machine has seen
+	// applied, across seals and published versions alike. It only ever grows,
+	// because Raft applies this group's log in order and commit timestamps are
+	// handed out by a single oracle in increasing order.
+	//
+	// It exists so the read barrier's guarantee is *observable* rather than merely
+	// argued: a reader that has taken a barrier on this group can check that
+	// appliedCommitTS is already at or past the snapshot it is about to read at.
+	// See docs/03-read-barrier.md.
+	appliedCommitTS Timestamp
 }
 
 // NewStore creates the state machine for one group.
@@ -160,6 +171,11 @@ func (s *Store) Apply(command any) any {
 		return s.resolveLock(*cmd.ResolveLockArgs)
 	case CmdQueryLock:
 		return s.queryLock(*cmd.QueryLockArgs)
+	case CmdBarrier:
+		// The barrier carries no payload and changes nothing. Its whole purpose is
+		// its position in the log: reaching this point proves that every entry
+		// before it has been applied. See docs/03-read-barrier.md.
+		return TxnResult{Status: StatusOK}
 	default:
 		panic(fmt.Sprintf("txn: unexpected command kind %v", cmd.Kind))
 	}
@@ -491,6 +507,7 @@ func (s *Store) seal(args SealArgs) TxnResult {
 	}
 
 	lock.CommitTS = args.CommitTS
+	s.observeCommitTS(args.CommitTS)
 	// Sealing extends the lease: the transaction is now decided, and a reader
 	// should get a chance to see the decision before anybody force-resolves it.
 	lock.ExpiresAt = s.expiresAt()
@@ -636,7 +653,26 @@ func (s *Store) publishVersion(key Key, startTS, commitTS Timestamp, kind OpKind
 		Kind:    kind,
 		Value:   value,
 	})
+	s.observeCommitTS(commitTS)
 }
+
+// observeCommitTS records that this state machine has now seen commitTS applied.
+//
+// It is called from the two places a commit timestamp enters the state machine: a
+// seal (the transaction's commit point, which may precede the write) and a
+// published version. Taking the maximum over both is deliberate. A snapshot
+// reader is exposed to a transaction from the moment the group knows the
+// transaction committed, not only once its value is visible, so the watermark has
+// to move at the seal.
+func (s *Store) observeCommitTS(commitTS Timestamp) {
+	if commitTS > s.appliedCommitTS {
+		s.appliedCommitTS = commitTS
+	}
+}
+
+// AppliedCommitTS returns the highest commit timestamp this state machine has
+// applied. Test-only, and the observability hook for the read barrier.
+func (s *Store) AppliedCommitTS() Timestamp { return s.appliedCommitTS }
 
 // --- CmdRollback -------------------------------------------------------------
 

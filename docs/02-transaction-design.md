@@ -285,40 +285,61 @@ otherwise:
   invisible at snapshot `C` and visible at `C+1`. Assertions of the form "visible
   immediately after commit" must therefore read at `C+1`.
 
-### 7.5 Known open issue: cross-key snapshot reads
-
-**This is an open problem, recorded rather than hidden.**
+### 7.5 Cross-key snapshot reads, and the read barrier
 
 A read-only transaction reads each key through its own Raft round trip, all at one
-read timestamp. But a read timestamp does not by itself guarantee that every
+read timestamp. A read timestamp does not by itself guarantee that every
 transaction committed below it has already become *visible* in every group:
 
 ```
 T1 reads A and B at snapshot S
-T2 commits at c2 < S, but c2's entry has committed in A's group
-   and not yet in B's group
+T2 committed at c2 < S, and its write to A's group is applied
+                         while its write to B's group is not
 => T1 sees A's new value and B's old value: an inconsistent snapshot
 ```
 
-The standard fix is a **read barrier**: after acquiring a candidate read
-timestamp, wait until every group has applied up to it before serving reads (or
-fall back to `ReadIndex`). This repository **does not implement that yet**.
+**A read barrier is implemented** (docs/03-read-barrier.md). Each transaction takes
+one no-op log entry per group before its first read from that group; because Raft
+applies entries in log order, waiting for that entry to be applied proves the group
+has applied everything already ahead of it in its log. The argument is in the
+design document, along with the property it does *not* give: a per-group barrier
+cannot cover a transaction that has been decided but whose write has not yet been
+proposed to the group. Closing that needs a barrier against the timestamp oracle —
+a registry of which allocated timestamps have finished — and that is not
+implemented.
 
-`TestConcurrentTransfersPreserveInvariant` can therefore observe a total of 199 or
-201 while transfers are still landing, even though every individual transfer is
-correct. The test waits for the cluster to settle before auditing, which narrows
-that window. Attributing its intermittent failures to this window is **plausible
-but not proven** — I did not run it to ground, so it is recorded here as open
-rather than presented as explained.
+### 7.6 The lease-rollback race (open, and it breaks atomicity)
 
-One methodology lesson from that investigation is worth recording, because it cost
-most of the time: self-checks of the form "commit succeeded, so read the value back
-and compare it to what was written" are **not sound**. Concurrent transactions
-write the same values, leadership moves, and followers lag. Correlating a *value*
-with a *transaction* does not work. The only reliable statement is "all replicas
-agree about the same log", which is what `Cluster.WaitForSettled` checks.
+Chasing the remaining conservation failures turned up something more serious than
+read skew, and it is recorded in full in docs/03-read-barrier.md §2. In short:
 
-### 7.6 Not serializable, deliberately
+* A lock lease can lapse while the coordinator is still working (it may be waiting
+  out another transaction's lock, which can take up to `resolveTimeout`).
+* A reader that finds a lapsed lock whose primary is still unsealed concludes the
+  owner is dead and rolls it back.
+* The coordinator then seals the primary and commits a transaction whose other
+  write has already been discarded.
+
+Evidence: after a quiescent run, one account's version chain contained commit
+timestamp 44 and the other's did not — a commit present in one group and absent
+from the other.
+
+`Txn.verifyLocksHeld` now checks that every intent lock is still held **before** the
+commit point is written, and aborts with `LockRolledBackError` (retryable) if any
+lock is gone. That is correct and removes the common case, but it narrows the race
+rather than closing it: the check is a read, not a reservation, so a lease can still
+lapse between the check and the seal. Closing it properly needs a tombstone in the
+primary group (the Percolator approach), or the same oracle-side completion
+registry §7.5 needs.
+
+**Consequence, stated plainly:** until that is fixed, this store does not guarantee
+that all writes of a committed transaction are present. It guarantees they appear
+eventually for transactions whose coordinator stays alive and whose locks are not
+reclaimed. `TestConcurrentTransfersPreserveInvariant` fails intermittently for this
+reason and is deliberately left enabled rather than skipped, so the defect stays
+visible.
+
+### 7.7 Not serializable, deliberately
 
 Snapshot isolation permits write skew: two transactions reading overlapping sets
 and writing disjoint keys can both commit, producing a state no serial order
@@ -328,7 +349,7 @@ of work, it is separable (it would add a read-set check to `prewrite`), and
 pretending to have it by labelling SI as serializable would be worse than not
 having it.
 
-### 7.7 The single-group fast path
+### 7.8 The single-group fast path
 
 When every key of a transaction lives in one group, `CmdPrewrite` can commit the
 writes in the *same* log entry that creates the locks (`OneShot`). That is sound

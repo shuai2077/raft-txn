@@ -334,6 +334,21 @@ func (cm *ConsensusModule) LeaderID() int {
 	return cm.leaderId
 }
 
+// CommitIndex returns the highest log index this module knows to be committed,
+// or -1 when it has committed nothing.
+//
+// It is a local, non-authoritative reading: on a follower it reflects what the
+// leader has told it so far. It exists so a caller can observe how far a group's
+// log has advanced without submitting an entry of its own. The read barrier does
+// *not* rely on it - a barrier establishes the group's applied position by being
+// applied itself, which needs no index arithmetic and no assumptions about which
+// node answered.
+func (cm *ConsensusModule) CommitIndex() int {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.commitIndex
+}
+
 // Submit submits a new command to the CM. This function doesn't block; clients
 // read the commit channel passed in the constructor to be notified of new
 // committed entries.

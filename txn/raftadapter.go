@@ -204,6 +204,25 @@ func (rl *RaftLog) Locked(ctx context.Context, txnID TxnID, key Key) (*LockInfo,
 	return res.Lock, nil
 }
 
+// Barrier implements Participant: it drives one no-op command through the log and
+// waits for it to be applied.
+//
+// The wait is the whole point. ApplyCommand returns only once the entry has been
+// committed by a quorum *and* the state machine has processed it, and Raft
+// applies entries in log order, so returning from this call proves the group has
+// applied everything that preceded the barrier in its log. That is exactly the
+// read barrier's guarantee - see docs/03-read-barrier.md.
+func (rl *RaftLog) Barrier(ctx context.Context) error {
+	res, err := rl.ApplyCommand(ctx, TxnCommand{Kind: CmdBarrier})
+	if err != nil {
+		return err
+	}
+	if res.Failed() {
+		return errorForResult(res, nil, "")
+	}
+	return nil
+}
+
 // --- shared conversion helpers ----------------------------------------------
 
 func valueOrError(res TxnResult, err error, key Key) (Value, error) {

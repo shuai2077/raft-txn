@@ -183,6 +183,30 @@ func (e *TxnNotFoundError) Error() string {
 	return fmt.Sprintf("txn: transaction %d not found", e.TxnID)
 }
 
+// LockRolledBackError reports that one of the transaction's intent locks was
+// discarded before its commit point was written.
+//
+// It is a *safe* failure: because the lock went away before the primary was
+// sealed, no commit decision exists and no version was published, so the
+// transaction is still invisible and the caller may simply retry it. It is
+// reported rather than retried silently because the caller needs to know its
+// prepared work was undone.
+//
+// It exists because a lock lease can lapse while a coordinator is still working. A
+// reader that finds a lapsed lock whose primary is unsealed discards it; if the
+// coordinator then sealed the primary, it would commit a transaction whose other
+// write had already been thrown away. The coordinator therefore verifies its locks
+// are still held before writing the commit point.
+type LockRolledBackError struct {
+	TxnID TxnID
+	Key   Key
+}
+
+func (e *LockRolledBackError) Error() string {
+	return fmt.Sprintf("txn: transaction %d: intent lock on %q was rolled back before commit",
+		e.TxnID, e.Key)
+}
+
 // ProtocolError reports the coordinator and the state machine disagreeing about
 // a transaction's shape. It always indicates a bug rather than a data race.
 type ProtocolError struct {

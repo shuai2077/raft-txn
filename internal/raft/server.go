@@ -278,6 +278,18 @@ func (s *Server) LeaderID() int {
 	return cm.LeaderID()
 }
 
+// CommitIndex returns the highest log index this server knows to be committed,
+// or -1 when it has no CommitModule yet or has committed nothing.
+func (s *Server) CommitIndex() int {
+	s.mu.Lock()
+	cm := s.cm
+	s.mu.Unlock()
+	if cm == nil {
+		return -1
+	}
+	return cm.CommitIndex()
+}
+
 // DisconnectAll closes all the client connections to peers for this server.
 func (s *Server) DisconnectAll() {
 	s.mu.Lock()

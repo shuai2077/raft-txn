@@ -260,6 +260,7 @@ func (n *Node) serveHTTP(addr string) error {
 	mux.HandleFunc("POST /txn/commit/", n.handleCommit)
 	mux.HandleFunc("POST /txn/rollback/", n.handleRollback)
 	mux.HandleFunc("POST /txn/locked/", n.handleLocked)
+	mux.HandleFunc("POST /txn/barrier/", n.handleBarrier)
 	mux.HandleFunc("GET /txn/status/", n.handleStatus)
 
 	n.httpServer = &http.Server{Handler: mux}
@@ -390,6 +391,22 @@ func (n *Node) handleCommit(w http.ResponseWriter, req *http.Request) {
 			CommitTS:       uint64(res.CommitTS),
 			KeysFinalized:  res.KeysFinalized,
 		}
+	})
+}
+
+// handleBarrier drives one no-op entry through the group's log and reports the
+// result. It carries no payload: a barrier's meaning is its position in the log.
+//
+// The response is only written once the entry has been applied by the state
+// machine, which is what makes the round trip a barrier. See
+// docs/03-read-barrier.md.
+func (n *Node) handleBarrier(w http.ResponseWriter, req *http.Request) {
+	var body BarrierRequest
+	if !n.decode(w, req, &body) {
+		return
+	}
+	n.propose(w, req, txn.TxnCommand{Kind: txn.CmdBarrier}, func(res txn.TxnResult) any {
+		return WriteResponse{ResponseStatus: responseStatus(res)}
 	})
 }
 

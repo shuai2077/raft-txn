@@ -83,6 +83,14 @@ type LockedRequest struct {
 	Key   string `json:"key"`
 }
 
+// BarrierRequest is the (empty) body of a read-barrier request.
+//
+// It carries nothing because a barrier's meaning is its position in the group's
+// log, not its payload. It exists as a named type anyway so the request is sent
+// as a body-bearing POST: the transport downgrades a bodyless request to GET, and
+// the barrier route is a POST.
+type BarrierRequest struct{}
+
 // --- response types ----------------------------------------------------------
 
 // ResponseStatus is embedded in every response.

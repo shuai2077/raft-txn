@@ -224,6 +224,24 @@ func (gc *GroupClient) Locked(ctx context.Context, txnID txn.TxnID, key txn.Key)
 	return lockInfoFromWire(resp.Lock), nil
 }
 
+// Barrier implements txn.Participant: it drives one no-op entry through the
+// group's log and waits for it to be applied.
+//
+// The round trip is what makes it a barrier. The handler returns only after
+// Server.Apply has seen the entry applied by the state machine, and Raft applies
+// entries in log order, so a successful return proves the group has applied
+// everything that preceded the barrier.
+func (gc *GroupClient) Barrier(ctx context.Context) error {
+	// A barrier carries no meaning in its payload, but it must still be sent as a
+	// POST with a body: the transport picks GET when the body is nil, and the
+	// route is a POST. Sending an empty request keeps the method honest.
+	var resp WriteResponse
+	if err := gc.roundTrip(ctx, "barrier", BarrierRequest{}, &resp); err != nil {
+		return err
+	}
+	return convertWriteError(resp, "")
+}
+
 // Status queries the leader-discovery endpoint of the group's current leader.
 func (gc *GroupClient) Status(ctx context.Context) (StatusResponse, error) {
 	var out StatusResponse
@@ -486,6 +504,17 @@ func (c *Client) Participants() map[txn.GroupID]txn.Participant {
 func (c *Client) Group(id txn.GroupID) (*GroupClient, bool) {
 	gc, ok := c.groups[id]
 	return gc, ok
+}
+
+// ParticipantFor returns the group's Participant, or an error when this client
+// knows nothing about that group. Used by the cluster harness and by callers that
+// need to reach a specific group without going through the coordinator.
+func (c *Client) ParticipantFor(id txn.GroupID) (txn.Participant, error) {
+	gc, ok := c.groups[id]
+	if !ok {
+		return nil, fmt.Errorf("txnservice: no participant for group %d", id)
+	}
+	return gc, nil
 }
 
 // ResolveLock implements txn.Resolver for the client's group set.

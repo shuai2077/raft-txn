@@ -607,6 +607,15 @@ func isTransient(err error) bool {
 	// A read that gave up waiting for a foreign lock is also transient: the
 	// transaction changed nothing, so retrying it is safe and the lock will
 	// usually be gone by then.
+	//
+	// A lock rolled back before the commit point is transient for the same reason,
+	// plus one more: it is only *reachable* because the coordinator refuses to seal
+	// a commit point over locks that are gone. Nothing was published and no
+	// decision exists, so the transaction can simply be run again.
+	var rolledBack *txn.LockRolledBackError
+	if errors.As(err, &rolledBack) {
+		return true
+	}
 	var nl *txn.NotLeaderError
 	return errors.As(err, &nl)
 }

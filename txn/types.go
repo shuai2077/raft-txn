@@ -259,6 +259,20 @@ type Participant interface {
 	// when there is none. It is a read-only query used to discover a lock's
 	// fate.
 	Locked(ctx context.Context, txnID TxnID, key Key) (*LockInfo, error)
+
+	// Barrier blocks until this group has applied every entry in its log as of
+	// the moment of the call.
+	//
+	// It is the read barrier. A reader that takes a barrier on a group and then
+	// reads that group at a snapshot timestamp acquired *before* the barrier was
+	// taken is guaranteed not to miss a write that had already been decided: Raft
+	// applies entries in log order, so the barrier cannot be applied until
+	// everything ahead of it has been, and a write decided before the snapshot
+	// was issued was proposed before the barrier.
+	//
+	// It changes no state. Without it, a cross-key snapshot read can see one side
+	// of a committed transaction and not the other - see docs/03-read-barrier.md.
+	Barrier(ctx context.Context) error
 }
 
 // Resolver clears intent locks whose owning transaction is dead.

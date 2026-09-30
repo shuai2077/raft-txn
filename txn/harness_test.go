@@ -125,6 +125,14 @@ func (dl *directLog) Locked(ctx context.Context, txnID TxnID, key Key) (*LockInf
 	return res.Lock, nil
 }
 
+func (dl *directLog) Barrier(ctx context.Context) error {
+	res, err := dl.ApplyCommand(ctx, TxnCommand{Kind: CmdBarrier})
+	if err != nil {
+		return err
+	}
+	return errorForResult(res, nil, "")
+}
+
 // --- scriptable oracle -------------------------------------------------------
 
 // fakeOracle hands out timestamps from a strict counter. Unlike LocalOracle it
