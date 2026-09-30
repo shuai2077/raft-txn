@@ -904,15 +904,17 @@ func (c *Client) queryPrimaryDecision(ctx context.Context, group GroupID, txnID 
 //
 // This is the safety-critical part of the whole design. The rules are:
 //
-//	lock carries a timestamp  -> the owner decided to commit; finish the write
-//	primary decided commit    -> finish the write
-//	primary still undecided   -> the owner may be about to commit; wait
-//	primary's actor is aborted-> discard the lock
-//	primary's actor unknown   -> the owner died before deciding; discard
+//	lock carries a timestamp   -> the owner decided to commit; finish the write
+//	primary decided commit     -> finish the write
+//	primary durably aborted    -> discard the lock
+//	primary still undecided    -> ask it to record an abort, which it refuses if
+//	                              the transaction committed first; otherwise wait
 //
 // The one thing that must never happen is discarding a lock whose transaction
 // committed: that would silently lose an acknowledged write. So the decision is
-// always taken by inspecting the *primary*, never by the age of this lock alone.
+// always taken by the *primary group*, through Raft, and never inferred from the
+// age of a lock or from a group having no record. An earlier version did infer it,
+// from a lapsed lease, and lost writes; see docs/03-read-barrier.md §2.
 func (c *Client) resolveLock(ctx context.Context, group GroupID, lock TxnLock) error {
 	if c.resolver == nil {
 		return fmt.Errorf("txn: no lock resolver configured; cannot resolve lock on %q", lock.Primary)

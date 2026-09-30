@@ -107,7 +107,12 @@ type ConsensusModule struct {
 	// goroutine to exit, to ensure a clean shutdown.
 	newCommitReadyChan   chan struct{}
 	newCommitReadyChanWg sync.WaitGroup
-
+	// electionTimerWg tracks election timer goroutines, so Stop can wait for them
+	// instead of returning while one is still winding down (txnkv local
+	// extension). They exit promptly once the module is Dead, but without being
+	// waited for they can outlive Shutdown by up to one tick, which goroutine-leak
+	// checks in tests notice.
+	electionTimerWg sync.WaitGroup
 	// stopChan is closed by Stop so that a goroutine handing an entry to a
 	// client's commit channel cannot block shutdown forever when that client has
 	// stopped reading (txnkv local extension).
@@ -386,6 +391,11 @@ func (cm *ConsensusModule) Stop() {
 	// monitors it to exit.
 	close(cm.newCommitReadyChan)
 	cm.newCommitReadyChanWg.Wait()
+
+	// Election timers exit once they observe Dead, which the state change above
+	// guarantees. Waiting here keeps Shutdown from returning while one is still
+	// between ticks, so a caller's goroutine-leak check sees none of them.
+	cm.electionTimerWg.Wait()
 }
 
 // restoreFromStorage restores the persistent state of this CM from storage.
@@ -751,7 +761,24 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	}
 	cm.electionResetEvent = time.Now()
 
-	go cm.runElectionTimer()
+	cm.spawnElectionTimer()
+}
+
+// spawnElectionTimer starts an election timer goroutine, registered before it is
+// spawned so Stop can reliably wait for it.
+//
+// The timer exits on its own shortly after the module becomes Dead, but without
+// being waited for it can outlive Shutdown by up to one tick. That is invisible in
+// production and very visible in a goroutine-leak check, which is exactly what it
+// is for - so it is tracked rather than left to chance.
+//
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) spawnElectionTimer() {
+	cm.electionTimerWg.Add(1)
+	go func() {
+		defer cm.electionTimerWg.Done()
+		cm.runElectionTimer()
+	}()
 }
 
 // startLeader switches cm into a leader state and begins process of heartbeats.

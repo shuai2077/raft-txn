@@ -316,16 +316,22 @@ func (s *Server) Shutdown() {
 	// Wake the accept loop. Closing the listener is the intended mechanism, but
 	// on some platforms a blocked Accept is not always released by Close, so a
 	// throwaway connection is dialled to guarantee forward progress.
+	//
+	// The dial is done synchronously, and after the accept loop is known to have
+	// exited. Running it as a fire-and-forget goroutine left a connection attempt
+	// in flight past the end of Shutdown, which leaked a goroutine and made
+	// goroutine-leak checks flaky.
 	_ = s.listener.Close()
-	go s.wakeAcceptLoop()
+	s.wakeAcceptLoop()
+	<-s.acceptDone
 
 	s.closeConns()
-	<-s.acceptDone
 	s.wg.Wait()
 }
 
 // wakeAcceptLoop dials the server's own address once so that a blocked Accept
-// call returns. The connection is closed immediately.
+// call returns. The connection is closed immediately, and the call is bounded by
+// a short timeout so Shutdown cannot stall on it.
 func (s *Server) wakeAcceptLoop() {
 	addr := s.GetListenAddr()
 	if addr == nil {

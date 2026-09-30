@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/eliben/raft/txnkv/txn"
@@ -35,19 +36,73 @@ const TestLockTTL = time.Second
 
 // testPortCursor spaces successive test clusters apart so that a harness which
 // outlives a subtest cannot collide with the next one's ports.
+//
+// Spacing alone is not enough. Ports released by a finished cluster linger briefly
+// in TIME_WAIT, and a test that starts a cluster, shuts it down, and starts another
+// can land on one of them. That is a property of the operating system, not of how
+// far apart the bases are, so the allocator verifies each port is actually bindable
+// and skips the ones that are not.
 var testPortCursor = testHTTPBase
+
+// reservePorts claims count consecutive bindable ports, advancing the shared cursor
+// past them.
+//
+// It binds each candidate to prove it is free, and skips a port that is not. The
+// probe listener is closed before the port is handed out, which leaves a small race
+// with another process; in exchange it turns a class of flaky "bind: Only one usage
+// of each socket address" failures into a reliable skip.
+func reservePorts(count int) int {
+	const maxAttempts = 64
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		base := testPortCursor
+		testPortCursor += 256
+		if allBindable(base, count) {
+			return base
+		}
+	}
+	// Nothing available in the scanned range. Hand back a base anyway so the
+	// config is usable; the caller will surface a clear bind error rather than a
+	// hang, and the range is wide enough that this is effectively unreachable.
+	return testPortCursor
+}
+
+// allBindable reports whether count consecutive ports starting at base can all be
+// bound right now.
+func allBindable(base, count int) bool {
+	listeners := make([]net.Listener, 0, count)
+	defer func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+	}()
+	for i := 0; i < count; i++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+i))
+		if err != nil {
+			return false
+		}
+		listeners = append(listeners, ln)
+	}
+	return true
+}
+
+// TestConfigPorts is how many ports one TestConfig cluster needs: a node and a
+// Raft peer listener for every group member, plus the same for every oracle
+// member, and a little slack.
+func TestConfigPorts(numGroups int) int {
+	return 2*(numGroups*3+3) + 4
+}
 
 // TestConfig returns a Config suitable for a test: small groups, three-node Raft
 // per group, a three-member oracle, and a short lock lease.
 func TestConfig(numGroups int, partitioner txn.Partitioner) Config {
-	testPortCursor += 256
+	base := reservePorts(TestConfigPorts(numGroups))
 	return Config{
 		NumGroups:     numGroups,
 		NodesPerGroup: 3,
 		TSONodes:      3,
 		WindowSize:    64,
 		LockTTL:       TestLockTTL,
-		HTTPBase:      testPortCursor,
+		HTTPBase:      base,
 		Partitioner:   partitioner,
 	}
 }
