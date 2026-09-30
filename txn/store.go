@@ -818,6 +818,44 @@ func (s *Store) LockedKeys() []Key {
 	return keys
 }
 
+// Locks returns every live intent lock, keyed by the key it protects. Expired
+// locks are included: they are still present in the state machine until
+// somebody resolves them, and tests need to see that. Test-only.
+func (s *Store) Locks() map[Key]TxnID {
+	out := make(map[Key]TxnID, len(s.locks))
+	for k, lock := range s.locks {
+		out[k] = lock.TxnID
+	}
+	return out
+}
+
+// LockFor returns a copy of the lock held on key, or nil when there is none.
+// Test-only.
+func (s *Store) LockFor(key Key) *LockInfo {
+	lock, ok := s.locks[key]
+	if !ok {
+		return nil
+	}
+	info := lock.InfoForKey(key)
+	return &info
+}
+
+// ValueAtNow reads key as of the latest committed state. Test-only.
+func (s *Store) ValueAtNow(key Key) (Value, bool) {
+	return s.valueAt(key, ^Timestamp(0))
+}
+
+// ValueAt reads key as of the snapshot ts. Test-only.
+func (s *Store) ValueAt(key Key, ts Timestamp) (Value, bool) { return s.valueAt(key, ts) }
+
+func (s *Store) valueAt(key Key, ts Timestamp) (Value, bool) {
+	v, found := s.latestVersionAt(key, ts)
+	if !found {
+		return "", false
+	}
+	return v.Value, true
+}
+
 // Sync is a no-op: the state machine has no background goroutines and no
 // buffered state to flush, because every mutation arrived through the Raft log.
 func (s *Store) Sync() {}

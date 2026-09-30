@@ -337,14 +337,11 @@ func (tc *testCluster) MustCommit(txn *Txn) Timestamp {
 	return ts
 }
 
-// Prewrite runs only the prepare phase of a transaction, leaving its intent
-// locks in place.
-//
-// This models a coordinator that dies after prewriting, which is precisely the
-// window the lock-recovery protocol exists to handle.
-func (tc *testCluster) Prewrite(txn *Txn) {
+// PrewriteAll runs only the prepare phase of a transaction, leaving its intent
+// locks in place. It is the harness's wrapper over txn.Prewrite.
+func (tc *testCluster) PrewriteAll(txn *Txn) {
 	tc.t.Helper()
-	if _, err := txn.prewrite(context.Background()); err != nil {
+	if err := Prewrite(txn); err != nil {
 		tc.t.Fatalf("prewrite: %v", err)
 	}
 }

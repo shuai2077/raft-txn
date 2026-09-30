@@ -50,6 +50,12 @@ type Client struct {
 	// DefaultResolveTimeout.
 	resolveTimeout time.Duration
 
+	// now returns the current time in milliseconds and is used to decide whether
+	// a foreign lock's lease has expired. Production uses the wall clock; tests
+	// substitute a controllable clock so that lease expiry can be exercised
+	// instantly rather than by waiting out a real TTL.
+	now func() uint64
+
 	// clientID identifies this client process; combined with a per-operation
 	// request ID it gives the replicated state machines a way to recognize
 	// retries.
@@ -78,12 +84,32 @@ func NewClient(oracle Oracle, partitioner Partitioner, participants map[GroupID]
 		partitioner:  partitioner,
 		participants: participants,
 		resolver:     resolver,
+		now:          nowMillis,
 		clientID:     nextClientID(),
 	}
 }
 
+// SetClock replaces the clock used to judge whether a foreign lock's lease has
+// expired. It must be called before the client resolves locks.
+func (c *Client) SetClock(fn func() uint64) {
+	if fn != nil {
+		c.now = fn
+	}
+}
+
+// clock returns the lease clock, defaulting to the wall clock.
+func (c *Client) clock() func() uint64 {
+	if c.now == nil {
+		return nowMillis
+	}
+	return c.now
+}
+
 // ClientID returns the identifier this client stamps on its requests.
 func (c *Client) ClientID() int64 { return c.clientID }
+
+// Oracle returns the timestamp source this client uses.
+func (c *Client) Oracle() Oracle { return c.oracle }
 
 // SetResolveTimeout overrides how long reads wait on a live foreign lock.
 func (c *Client) SetResolveTimeout(d time.Duration) {
@@ -91,6 +117,14 @@ func (c *Client) SetResolveTimeout(d time.Duration) {
 		c.resolveTimeout = d
 	}
 }
+
+// SetResolver installs the lock-resolution policy.
+//
+// The coordinator and its resolver are mutually recursive - the resolver walks
+// the coordinator's participant set, and the coordinator needs a resolver to
+// clear foreign locks - so the resolver is bound after construction rather than
+// passed in.
+func (c *Client) SetResolver(r Resolver) { c.resolver = r }
 
 var globalClientCount atomic.Int64
 
@@ -393,6 +427,24 @@ func (t *Txn) checkActive() error {
 	return nil
 }
 
+// Prewrite runs only the prepare phase of a transaction, leaving its intent
+// locks in place.
+//
+// It exists so that tests (and administrators) can reproduce the state a
+// coordinator leaves behind when it dies after preparing: intent locks with no
+// commit decision. A real coordinator never needs it, because Commit performs
+// the prepare itself.
+func Prewrite(tx *Txn) error {
+	if tx.state != stateActive {
+		return fmt.Errorf("txn: transaction %d is %s", tx.id, tx.state)
+	}
+	if len(tx.writes) == 0 {
+		return nil
+	}
+	_, err := tx.prewrite(context.Background())
+	return err
+}
+
 // --- two-phase commit steps --------------------------------------------------
 
 // prepResult carries the outcome of the prepare phase.
@@ -674,12 +726,15 @@ func (c *Client) probePrimary(ctx context.Context, group GroupID, txnID TxnID,
 func (c *Client) ensurePrimaryResolved(ctx context.Context, lock TxnLock) (State, Timestamp, error) {
 	primaryGroup := c.partitioner.GroupForKey(lock.Primary)
 	deadline := time.Now().Add(c.resolveTimeoutOrDefault())
+	var lastSeen *LockInfo
+	var lastState State
 
 	for attempt := 0; ; attempt++ {
 		state, commitTS, info, err := c.probePrimary(ctx, primaryGroup, lock.TxnID, lock.Primary)
 		if err != nil {
 			return StateInvalid, 0, fmt.Errorf("txn: probing primary lock of txn %d: %w", lock.TxnID, err)
 		}
+		lastSeen, lastState = info, state
 
 		switch {
 		case state == StateCommitted:
@@ -694,10 +749,11 @@ func (c *Client) ensurePrimaryResolved(ctx context.Context, lock TxnLock) (State
 
 		// Still prepared. Give a live owner a chance to finish; once its lease has
 		// expired, declare the transaction dead.
-		if !info.Expired(nowMillis()) {
+		if !info.Expired(c.clock()()) {
 			if time.Now().After(deadline) {
 				return StateInvalid, 0, fmt.Errorf(
-					"txn: timed out waiting for txn %d to decide about key %q", lock.TxnID, lock.Primary)
+					"txn: timed out waiting for txn %d to decide about key %q (group %d last reported state=%v lock=%+v)",
+					lock.TxnID, lock.Primary, primaryGroup, lastState, lastSeen)
 			}
 			if err := sleepCtx(ctx, resolveBackoff(attempt)); err != nil {
 				return StateInvalid, 0, err
@@ -765,13 +821,15 @@ func (c *Client) resolveRemote(ctx context.Context, group GroupID, lock TxnLock,
 // primary group through the same Participant set the coordinator uses, then
 // applies the resulting verdict to the group that holds the lock.
 //
-// Because it needs to reach *other* groups it is built from the full participant
-// map rather than from one group's view.
+// It holds a pointer to the Client rather than a copy, so it observes the
+// client's resolver binding as soon as it is set. That matters because the
+// client and its resolver are mutually recursive: the resolver needs the
+// client's participant set, and the client needs a resolver to clear locks.
 type DefaultResolver struct {
 	client *Client
 }
 
-// NewResolver builds the standard lock resolver for a participant set.
+// NewResolver builds the standard lock resolver for a client.
 func NewResolver(client *Client) *DefaultResolver { return &DefaultResolver{client: client} }
 
 // ResolveLock implements Resolver.

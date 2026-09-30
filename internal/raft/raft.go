@@ -102,6 +102,16 @@ type ConsensusModule struct {
 	newCommitReadyChan   chan struct{}
 	newCommitReadyChanWg sync.WaitGroup
 
+	// stopChan is closed by Stop so that a goroutine handing an entry to a
+	// client's commit channel cannot block shutdown forever when that client has
+	// stopped reading (txnkv local extension).
+	stopChan chan struct{}
+
+	// results maps a log index with an outstanding synchronous proposal to the
+	// channel that will receive the state machine's answer once the entry
+	// commits. Entries are registered by propose and filled in by the applier.
+	results map[int]chan proposalResult
+
 	// triggerAEChan is an internal notification channel used to trigger
 	// sending new AEs to followers when interesting changes occurred.
 	triggerAEChan chan struct{}
@@ -135,6 +145,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.triggerAEChan = make(chan struct{}, 1)
+	cm.stopChan = make(chan struct{})
 	cm.state = Follower
 	cm.votedFor = -1
 	cm.commitIndex = -1
@@ -142,6 +153,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 	cm.leaderId = -1
+	cm.results = make(map[int]chan proposalResult)
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
@@ -169,16 +181,25 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	return cm.id, cm.currentTerm, cm.state == Leader
 }
 
+// proposalResult is what a synchronous proposal eventually reports.
+type proposalResult struct {
+	value any
+	err   error
+}
+
 // StateMachineHandler is the optional state machine a ConsensusModule applies
 // committed commands through. Implementations must be deterministic: every
 // replica applies the same commands in the same order and must reach the same
 // state.
 //
-// Apply is called with the CM's lock held - the same critical section that
-// appends the entry to the log and recomputes commitIndex - so implementations
-// must not call back into the ConsensusModule and must not block on network
-// I/O. Apply must return quickly.
+// Apply is only ever called from the commit path, in log order, and never while
+// the ConsensusModule's own lock is held. Implementations may therefore take
+// their own locks and perform local state-machine I/O; they must not call back
+// into the ConsensusModule, and they must not block for long, since the applier
+// goroutine is what feeds the commit channel.
 type StateMachineHandler interface {
+	// Apply runs command and returns the state machine's answer, which is
+	// forwarded to whoever proposed the command.
 	Apply(command any) any
 }
 
@@ -190,43 +211,99 @@ func (cm *ConsensusModule) SetHandler(handler StateMachineHandler) {
 	cm.handler = handler
 }
 
-// applyHandler runs cmd through the installed state machine, after appending it
-// to this leader's log. It returns the state machine's result, or nil when no
-// handler is installed or this CM is not the leader.
+// propose appends cmd to this leader's log, fsyncs it, and returns the index it
+// landed at. It does not touch the state machine.
 // Expects cm.mu to be locked.
 //
-// Semantics: the command is appended to the log and fsynced, applied to the
-// state machine, and reported to the submitting client - all before Raft has
-// confirmed replication to a quorum. The entry is therefore durable on this
-// node from the moment the client is unblocked, but it is not yet *committed*:
-// if this node loses leadership before the entry reaches a quorum, the entry is
-// truncated and the state change disappears. That is safe as long as the state
-// machine and the caller tolerate a command being applied and then undone,
-// which the transaction layer does by deduplicating requests per client and by
-// making recovery idempotent. Callers that need quorum confirmation must read
-// the commit channel instead.
-func (cm *ConsensusModule) applyHandler(cmd any) any {
-	if cm.state != Leader {
-		return nil
-	}
+// The entry is durable on this node from the moment this returns, but it is not
+// yet *committed*: if this node loses leadership before the entry reaches a
+// quorum, it is truncated and never happens. A caller that must not observe a
+// rollback has to wait for the entry to commit - see waitApplied.
+func (cm *ConsensusModule) propose(cmd any) int {
+	index := len(cm.log)
 	cm.log = append(cm.log, LogEntry{Command: cmd, Term: cm.currentTerm})
 	cm.persistToStorage()
 
-	var result any
-	if cm.handler != nil {
-		result = cm.handler.Apply(cmd)
-	}
+	// Kick off replication now. The heartbeat goroutine would pick the entry up
+	// within 50ms, but making every follower trail every write by a heartbeat
+	// would be a needless latency floor, and would let the leader's log run
+	// arbitrarily far ahead of its replicas.
+	cm.triggerReplication()
 
-	// commitIndex can already cover the new entry (it may sit ahead of
-	// lastApplied), in which case the entry is genuinely committed and the
-	// applier goroutine has to be nudged.
-	if cm.commitIndex >= len(cm.log)-1 {
+	// If commitIndex already covers the new entry (it may sit ahead of
+	// lastApplied), the entry is genuinely committed and the applier goroutine
+	// has to be nudged.
+	if cm.commitIndex >= index {
 		select {
 		case cm.newCommitReadyChan <- struct{}{}:
 		default:
 		}
 	}
-	return result
+	return index
+}
+
+// waitApplied blocks until the entry at index has been handed to the state
+// machine and returns the handler's answer.
+//
+// It must be called *without* cm.mu held: the applier needs that lock to make
+// progress, and the state machine's Apply runs outside it.
+//
+// The wait is abandoned if this CM stops, or once timeout elapses - a leader
+// that lost its quorum can never commit, and blocking a client forever would be
+// worse than reporting the uncertainty.
+func (cm *ConsensusModule) waitApplied(index int, timeout time.Duration) (any, error) {
+	cm.mu.Lock()
+	if index < 0 || index >= len(cm.results) {
+		cm.mu.Unlock()
+		return nil, fmt.Errorf("raft: no proposal at index %d", index)
+	}
+	ch := cm.results[index]
+	cm.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case res, ok := <-ch:
+		if !ok {
+			return nil, fmt.Errorf("raft: proposal at index %d was abandoned", index)
+		}
+		if res.err != nil {
+			return nil, res.err
+		}
+		return res.value, nil
+	case <-cm.stopChan:
+		return nil, fmt.Errorf("raft: server stopped before the command committed")
+	case <-timer.C:
+		return nil, fmt.Errorf("raft: command at index %d was not committed in time (no quorum?)", index)
+	}
+}
+
+// abandonProposal gives up on a proposal and reports why. Whoever is waiting on
+// it stops blocking.
+func (cm *ConsensusModule) abandonProposal(index int, err error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	ch, ok := cm.results[index]
+	if !ok {
+		return
+	}
+	delete(cm.results, index)
+	select {
+	case ch <- proposalResult{err: err}:
+	default:
+	}
+}
+
+// triggerReplication asks the leader's heartbeat goroutine to send AppendEntries
+// now instead of waiting for the next heartbeat. It never blocks: if a send is
+// already queued, a further request adds nothing.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) triggerReplication() {
+	select {
+	case cm.triggerAEChan <- struct{}{}:
+	default:
+	}
 }
 
 // LeaderID returns the id of the last leader this CM heard from, or -1 when
@@ -270,6 +347,7 @@ func (cm *ConsensusModule) Stop() {
 	cm.dlog("CM.Stop called")
 	cm.mu.Lock()
 	cm.state = Dead
+	close(cm.stopChan)
 	cm.mu.Unlock()
 	cm.dlog("becomes Dead")
 
@@ -807,17 +885,26 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	}
 }
 
-// commitChanSender is responsible for sending committed entries on
-// cm.commitChan. It watches newCommitReadyChan for notifications and calculates
-// which new entries are ready to be sent. This method should run in a separate
-// background goroutine; cm.commitChan may be buffered and will limit how fast
-// the client consumes new committed entries. Returns when newCommitReadyChan is
-// closed.
+// commitChanSender is responsible for applying newly committed entries to the
+// state machine and sending them on cm.commitChan. It watches
+// newCommitReadyChan for notifications and calculates which new entries are
+// ready. This method should run in a separate background goroutine; cm.commitChan
+// may be buffered and will limit how fast the client consumes new committed
+// entries. Returns when newCommitReadyChan is closed.
+//
+// This is where the state machine is driven. It is the *only* place, and it is
+// deliberately outside the ConsensusModule lock: a state machine's Apply may
+// take its own locks, and holding cm.mu across it would let a slow Apply block
+// elections and heartbeats - and deadlock a concurrent Stop.
+//
+// Because only the applier applies, and it walks the log in order, every
+// replica's state machine is a function of its log. Commands proposed
+// synchronously through Server.Apply are answered from here as well, via the
+// per-index result channel registered by propose.
 func (cm *ConsensusModule) commitChanSender() {
 	defer cm.newCommitReadyChanWg.Done()
 
 	for range cm.newCommitReadyChan {
-		// Find which entries we have to apply.
 		cm.mu.Lock()
 		savedTerm := cm.currentTerm
 		savedLastApplied := cm.lastApplied
@@ -826,15 +913,47 @@ func (cm *ConsensusModule) commitChanSender() {
 			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
 			cm.lastApplied = cm.commitIndex
 		}
+		handler := cm.handler
 		cm.mu.Unlock()
 		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
 
 		for i, entry := range entries {
-			cm.dlog("send on commitchan i=%v, entry=%v", i, entry)
-			cm.commitChan <- CommitEntry{
+			index := savedLastApplied + i + 1
+
+			var result any
+			var applyErr error
+			if handler != nil {
+				result = handler.Apply(entry.Command)
+			}
+
+			// Hand the answer to whoever proposed this entry synchronously, if
+			// anybody did.
+			cm.mu.Lock()
+			if ch, ok := cm.results[index]; ok {
+				delete(cm.results, index)
+				cm.mu.Unlock()
+				select {
+				case ch <- proposalResult{value: result, err: applyErr}:
+				default:
+				}
+			} else {
+				cm.mu.Unlock()
+			}
+
+			cm.dlog("send on commitchan i=%v, index=%d entry=%v", i, index, entry)
+			select {
+			case cm.commitChan <- CommitEntry{
 				Command: entry.Command,
-				Index:   savedLastApplied + i + 1,
+				Index:   index,
 				Term:    savedTerm,
+			}:
+			case <-cm.stopChan:
+				// The client's commit channel is full and we are shutting down.
+				// Abandoning the rest is correct: the state machine has already
+				// been applied, and the commit channel is a notification
+				// mechanism, not the source of truth.
+				cm.dlog("commitChanSender stopping with %d entries undelivered", len(entries)-i)
+				return
 			}
 		}
 	}

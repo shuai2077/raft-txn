@@ -28,6 +28,11 @@ type Server struct {
 	serverId int
 	peerIds  []int
 
+	// acceptDone is closed once the accept loop has exited. Shutdown waits on it
+	// separately from wg so that it can tell "the loop is still blocked in
+	// Accept" from "a handler is still running".
+	acceptDone chan struct{}
+
 	cm       *ConsensusModule
 	storage  Storage
 	rpcProxy *RPCProxy
@@ -41,6 +46,13 @@ type Server struct {
 	ready <-chan any
 	quit  chan any
 	wg    sync.WaitGroup
+
+	// conns holds the currently open inbound RPC connections so that Shutdown can
+	// close them. Closing the listener stops new connections but does not disturb
+	// the handlers already blocked reading from established ones, so without this
+	// a shutdown could wait forever on a peer that is itself shutting down
+	// (txnkv local extension).
+	conns map[net.Conn]struct{}
 }
 
 func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
@@ -52,6 +64,8 @@ func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, c
 	s.ready = ready
 	s.commitChan = commitChan
 	s.quit = make(chan any)
+	s.conns = make(map[net.Conn]struct{})
+	s.acceptDone = make(chan struct{})
 	return s
 }
 
@@ -76,8 +90,18 @@ func (s *Server) Serve() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer close(s.acceptDone)
 
 		for {
+			// Check for shutdown before blocking in Accept. Combined with closing
+			// the listener below, this makes the loop exit promptly rather than
+			// relying on Accept surfacing an error from a closed listener.
+			select {
+			case <-s.quit:
+				return
+			default:
+			}
+
 			conn, err := s.listener.Accept()
 			if err != nil {
 				select {
@@ -87,13 +111,44 @@ func (s *Server) Serve() {
 					log.Fatal("accept error:", err)
 				}
 			}
+			s.trackConn(conn, true)
 			s.wg.Add(1)
 			go func() {
+				defer s.wg.Done()
+				defer s.trackConn(conn, false)
 				s.rpcServer.ServeConn(conn)
-				s.wg.Done()
+				conn.Close()
 			}()
 		}
 	}()
+}
+
+// trackConn records or forgets an inbound RPC connection.
+func (s *Server) trackConn(conn net.Conn, add bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if add {
+		if s.conns != nil {
+			s.conns[conn] = struct{}{}
+		}
+		return
+	}
+	delete(s.conns, conn)
+}
+
+// closeConns closes every open inbound RPC connection, which unblocks the
+// per-connection handlers so that a shutdown can finish.
+func (s *Server) closeConns() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	s.mu.Unlock()
+
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 // Submit wraps the underlying CM's Submit; see that method for documentation.
@@ -114,12 +169,28 @@ func (s *Server) SetHandler(handler StateMachineHandler) {
 	cm.SetHandler(handler)
 }
 
-// Apply submits cmd to the Raft log and returns the state machine's result,
-// along with an error describing why the command could not be proposed.
+// ApplyTimeout bounds how long Apply waits for its command to commit.
 //
-// The command is durable on this node when Apply returns, but it is not yet
-// committed by the cluster: see ConsensusModule.applyHandler for the precise
-// guarantee and for the obligations it places on the state machine.
+// It exists because a leader that has lost its quorum can never commit: waiting
+// forever would hang the client instead of telling it that the outcome is
+// unknown. Callers that can tolerate that uncertainty should prefer Submit and
+// the commit channel.
+const ApplyTimeout = 5 * time.Second
+
+// Apply proposes cmd to the Raft log and blocks until it is committed and the
+// state machine has applied it, then returns the state machine's result.
+//
+// This is the synchronous counterpart of Submit. It returns:
+//
+//   - a *NotLeaderError when this server is not the group's leader;
+//   - an error when the command did not commit in time (usually: no quorum);
+//   - otherwise the value StateMachineHandler.Apply returned for this command.
+//
+// Note that a command may be applied and then truncated if this leader loses
+// leadership before the entry replicates to a quorum. Apply does not return in
+// that case until the wait expires, and the state machine sees the entry
+// disappear with the log - so state machines should tolerate re-application,
+// which the transaction layer does by memoizing per-request results.
 func (s *Server) Apply(cmd any) (any, error) {
 	s.mu.Lock()
 	cm := s.cm
@@ -129,14 +200,47 @@ func (s *Server) Apply(cmd any) (any, error) {
 	}
 
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	if cm.state == Dead {
+		cm.mu.Unlock()
 		return nil, fmt.Errorf("raft: server is shut down")
 	}
 	if cm.state != Leader {
-		return nil, &NotLeaderError{LeaderID: cm.leaderId}
+		leaderID := cm.leaderId
+		cm.mu.Unlock()
+		return nil, &NotLeaderError{LeaderID: leaderID}
 	}
-	return cm.applyHandler(cmd), nil
+
+	index := cm.propose(cmd)
+	// Register interest before releasing the lock, so the applier cannot deliver
+	// the answer into a channel nobody is listening on.
+	ch := make(chan proposalResult, 1)
+	if cm.results == nil {
+		cm.results = make(map[int]chan proposalResult)
+	}
+	cm.results[index] = ch
+	// Nudge the applier in case the entry is already committed.
+	if cm.commitIndex >= index {
+		select {
+		case cm.newCommitReadyChan <- struct{}{}:
+		default:
+		}
+	}
+	cm.mu.Unlock()
+
+	timer := time.NewTimer(ApplyTimeout)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return res.value, nil
+	case <-cm.stopChan:
+		return nil, fmt.Errorf("raft: server stopped before the command committed")
+	case <-timer.C:
+		cm.abandonProposal(index, fmt.Errorf("raft: command was not committed in time (no quorum?)"))
+		return nil, fmt.Errorf("raft: command at index %d was not committed within %s", index, ApplyTimeout)
+	}
 }
 
 // NotLeaderError reports that a command was submitted to a replica that is not
@@ -174,11 +278,39 @@ func (s *Server) DisconnectAll() {
 }
 
 // Shutdown closes the server and waits for it to shut down properly.
+//
+// Order matters: stop the consensus module (which ends the commit applier),
+// signal the accept loop, close the listener, then close the established
+// connections. Closing connections last is what unblocks the per-connection RPC
+// handlers, which may be waiting on a peer that is shutting down at the same
+// time and will therefore never send anything again.
 func (s *Server) Shutdown() {
 	s.cm.Stop()
 	close(s.quit)
-	s.listener.Close()
+
+	// Wake the accept loop. Closing the listener is the intended mechanism, but
+	// on some platforms a blocked Accept is not always released by Close, so a
+	// throwaway connection is dialled to guarantee forward progress.
+	_ = s.listener.Close()
+	go s.wakeAcceptLoop()
+
+	s.closeConns()
+	<-s.acceptDone
 	s.wg.Wait()
+}
+
+// wakeAcceptLoop dials the server's own address once so that a blocked Accept
+// call returns. The connection is closed immediately.
+func (s *Server) wakeAcceptLoop() {
+	addr := s.GetListenAddr()
+	if addr == nil {
+		return
+	}
+	conn, err := net.DialTimeout("tcp", addr.String(), 200*time.Millisecond)
+	if err != nil {
+		return
+	}
+	_ = conn.Close()
 }
 
 func (s *Server) GetListenAddr() net.Addr {

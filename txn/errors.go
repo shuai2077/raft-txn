@@ -73,6 +73,15 @@ func (e *NotLeaderError) Error() string {
 	return fmt.Sprintf("txn: group %d: not the leader (leader hint: %d)", e.GroupID, e.LeaderID)
 }
 
+// LeaderHinter is implemented by Participants that can name the node currently
+// believed to lead their group. The coordinator uses it to aim the next attempt
+// directly instead of probing group members one by one.
+type LeaderHinter interface {
+	// LeaderHint returns the node id that leads the participant's group, or -1
+	// when unknown. It must not perform I/O.
+	LeaderHint() int
+}
+
 // LockedError reports that a key is protected by another transaction's intent
 // lock, so the requested read or write cannot proceed yet.
 //

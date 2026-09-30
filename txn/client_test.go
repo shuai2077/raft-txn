@@ -241,7 +241,7 @@ func TestReadBlocksOnUncommittedThenSeesCommit(t *testing.T) {
 	tc.MustPut(writer, "0a", "pending")
 
 	// Prewrite without committing: the lock is now visible.
-	tc.Prewrite(writer)
+	tc.PrewriteAll(writer)
 
 	reader := tc.Begin()
 	// The read must not succeed, and it must not silently treat the key as
@@ -275,7 +275,7 @@ func TestDeadWriterLockIsResolvedAndReadProceeds(t *testing.T) {
 	// transaction after prewrite.
 	dead := tc.Begin()
 	tc.MustPut(dead, "0a", "zombie")
-	tc.Prewrite(dead)
+	tc.PrewriteAll(dead)
 	if locks := tc.Group(0).LockedKeys(); len(locks) != 1 {
 		t.Fatalf("locks=%v, want the zombie lock", locks)
 	}
@@ -374,7 +374,7 @@ func TestAbortReleasesLocks(t *testing.T) {
 	tx := tc.Begin()
 	tc.MustPut(tx, "0a", "A")
 	tc.MustPut(tx, "1b", "B")
-	tc.Prewrite(tx)
+	tc.PrewriteAll(tx)
 	if err := tx.Abort(context.Background()); err != nil {
 		t.Fatalf("abort: %v", err)
 	}

@@ -40,11 +40,16 @@ type RaftLog struct {
 	// groupID is used for error messages and for the NotLeaderError hint.
 	groupID GroupID
 
-	// mu guards the late binding of store: SetStore is called after the server
-	// has started, while ApplyCommand may already race with it from another
-	// goroutine.
+	// mu guards the late binding of store (SetStore is called after the server
+	// has started, while ApplyCommand may already run from another goroutine) and
+	// the learnedLeader hint.
 	mu    sync.RWMutex
 	store *Store
+
+	// learnedLeader is the node id a previous rejected proposal was told leads
+	// the group. It lets the coordinator aim its next attempt correctly even
+	// when this replica has not yet heard from the leader itself.
+	learnedLeader int
 }
 
 // NewRaftLog wraps a started raft.Server as a transaction group.
@@ -71,6 +76,27 @@ func (rl *RaftLog) Store() *Store {
 	return rl.store
 }
 
+// LeaderHint implements LeaderHinter: it reports the node that leads this
+// group, without performing any I/O.
+func (rl *RaftLog) LeaderHint() int {
+	if id := rl.server.LeaderID(); id >= 0 {
+		return id
+	}
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+	return rl.learnedLeader
+}
+
+// learnLeader records a leadership hint obtained from a rejected proposal.
+func (rl *RaftLog) learnLeader(id int) {
+	if id < 0 {
+		return
+	}
+	rl.mu.Lock()
+	rl.learnedLeader = id
+	rl.mu.Unlock()
+}
+
 // GroupID reports which group this log belongs to.
 func (rl *RaftLog) GroupID() GroupID { return rl.groupID }
 
@@ -89,6 +115,7 @@ func (rl *RaftLog) ApplyCommand(ctx context.Context, cmd TxnCommand) (TxnResult,
 	if err != nil {
 		var notLeader *raft.NotLeaderError
 		if errors.As(err, &notLeader) {
+			rl.learnLeader(notLeader.LeaderID)
 			return TxnResult{}, &NotLeaderError{GroupID: rl.groupID, LeaderID: notLeader.LeaderID}
 		}
 		return TxnResult{}, err
@@ -98,7 +125,7 @@ func (rl *RaftLog) ApplyCommand(ctx context.Context, cmd TxnCommand) (TxnResult,
 	// the command was not applied. Report it as a routing failure so the caller
 	// retries against the new leader.
 	if out == nil {
-		return TxnResult{}, &NotLeaderError{GroupID: rl.groupID, LeaderID: rl.server.LeaderID()}
+		return TxnResult{}, &NotLeaderError{GroupID: rl.groupID, LeaderID: rl.LeaderHint()}
 	}
 
 	res, ok := out.(TxnResult)
