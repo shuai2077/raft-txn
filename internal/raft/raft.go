@@ -82,6 +82,18 @@ type ConsensusModule struct {
 	// entries. It's passed in by the client during construction.
 	commitChan chan<- CommitEntry
 
+	// --- txnkv local extension -------------------------------------------------
+	// handler, when set, is a state machine applied *synchronously* by
+	// applyHandler, so that the client that submitted a command can be answered
+	// directly. See SetHandler and applyHandler below; the rest of this file is
+	// the upstream implementation and is unaware of the hook.
+	handler StateMachineHandler
+
+	// leaderId is the last leader this CM heard from (-1 when unknown). It is
+	// only a routing hint for clients; see LeaderID.
+	leaderId int
+	// --- end txnkv local extension ---------------------------------------------
+
 	// newCommitReadyChan is an internal notification channel used by goroutines
 	// that commit new entries to the log to notify that these entries may be sent
 	// on commitChan. A goroutine monitors this channel and sends entries on
@@ -129,6 +141,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+	cm.leaderId = -1
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
@@ -154,6 +167,78 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+// StateMachineHandler is the optional state machine a ConsensusModule applies
+// committed commands through. Implementations must be deterministic: every
+// replica applies the same commands in the same order and must reach the same
+// state.
+//
+// Apply is called with the CM's lock held - the same critical section that
+// appends the entry to the log and recomputes commitIndex - so implementations
+// must not call back into the ConsensusModule and must not block on network
+// I/O. Apply must return quickly.
+type StateMachineHandler interface {
+	Apply(command any) any
+}
+
+// SetHandler installs the replicated state machine applied by committed log
+// entries. It must be called before the server starts accepting clients.
+func (cm *ConsensusModule) SetHandler(handler StateMachineHandler) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.handler = handler
+}
+
+// applyHandler runs cmd through the installed state machine, after appending it
+// to this leader's log. It returns the state machine's result, or nil when no
+// handler is installed or this CM is not the leader.
+// Expects cm.mu to be locked.
+//
+// Semantics: the command is appended to the log and fsynced, applied to the
+// state machine, and reported to the submitting client - all before Raft has
+// confirmed replication to a quorum. The entry is therefore durable on this
+// node from the moment the client is unblocked, but it is not yet *committed*:
+// if this node loses leadership before the entry reaches a quorum, the entry is
+// truncated and the state change disappears. That is safe as long as the state
+// machine and the caller tolerate a command being applied and then undone,
+// which the transaction layer does by deduplicating requests per client and by
+// making recovery idempotent. Callers that need quorum confirmation must read
+// the commit channel instead.
+func (cm *ConsensusModule) applyHandler(cmd any) any {
+	if cm.state != Leader {
+		return nil
+	}
+	cm.log = append(cm.log, LogEntry{Command: cmd, Term: cm.currentTerm})
+	cm.persistToStorage()
+
+	var result any
+	if cm.handler != nil {
+		result = cm.handler.Apply(cmd)
+	}
+
+	// commitIndex can already cover the new entry (it may sit ahead of
+	// lastApplied), in which case the entry is genuinely committed and the
+	// applier goroutine has to be nudged.
+	if cm.commitIndex >= len(cm.log)-1 {
+		select {
+		case cm.newCommitReadyChan <- struct{}{}:
+		default:
+		}
+	}
+	return result
+}
+
+// LeaderID returns the id of the last leader this CM heard from, or -1 when
+// none is known. It is a routing hint, not a guarantee: leadership may move
+// before the caller acts on it.
+func (cm *ConsensusModule) LeaderID() int {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Leader {
+		return cm.id
+	}
+	return cm.leaderId
 }
 
 // Submit submits a new command to the CM. This function doesn't block; clients
@@ -337,6 +422,9 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
+		// txnkv local extension: remember who the leader is, so clients can be
+		// pointed at it instead of guessing. It is a hint only.
+		cm.leaderId = args.LeaderId
 
 		// Does our log contain an entry at PrevLogIndex whose term matches
 		// PrevLogTerm? Note that in the extreme case of PrevLogIndex=-1 this is
@@ -547,6 +635,8 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
+	// txnkv local extension: a leader is its own leader.
+	cm.leaderId = cm.id
 
 	for _, peerId := range cm.peerIds {
 		cm.nextIndex[peerId] = len(cm.log)

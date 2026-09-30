@@ -101,6 +101,66 @@ func (s *Server) Submit(cmd any) int {
 	return s.cm.Submit(cmd)
 }
 
+// SetHandler installs the replicated state machine that commands are applied
+// to. It must be called after Serve (which creates the ConsensusModule) and
+// before clients start submitting commands.
+func (s *Server) SetHandler(handler StateMachineHandler) {
+	s.mu.Lock()
+	cm := s.cm
+	s.mu.Unlock()
+	if cm == nil {
+		panic("raft: SetHandler called before Serve")
+	}
+	cm.SetHandler(handler)
+}
+
+// Apply submits cmd to the Raft log and returns the state machine's result,
+// along with an error describing why the command could not be proposed.
+//
+// The command is durable on this node when Apply returns, but it is not yet
+// committed by the cluster: see ConsensusModule.applyHandler for the precise
+// guarantee and for the obligations it places on the state machine.
+func (s *Server) Apply(cmd any) (any, error) {
+	s.mu.Lock()
+	cm := s.cm
+	s.mu.Unlock()
+	if cm == nil {
+		return nil, fmt.Errorf("raft: Apply called before Serve")
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil, fmt.Errorf("raft: server is shut down")
+	}
+	if cm.state != Leader {
+		return nil, &NotLeaderError{LeaderID: cm.leaderId}
+	}
+	return cm.applyHandler(cmd), nil
+}
+
+// NotLeaderError reports that a command was submitted to a replica that is not
+// the leader of its Raft group. LeaderID carries a routing hint, or -1 when this
+// node does not know who the leader is.
+type NotLeaderError struct{ LeaderID int }
+
+func (e *NotLeaderError) Error() string {
+	return fmt.Sprintf("raft: not the leader (leader hint: %d)", e.LeaderID)
+}
+
+// LeaderID returns the id of the leader this server last heard from, or -1 when
+// it has no idea. When this server believes it is the leader, it returns its own
+// id.
+func (s *Server) LeaderID() int {
+	s.mu.Lock()
+	cm := s.cm
+	s.mu.Unlock()
+	if cm == nil {
+		return -1
+	}
+	return cm.LeaderID()
+}
+
 // DisconnectAll closes all the client connections to peers for this server.
 func (s *Server) DisconnectAll() {
 	s.mu.Lock()
