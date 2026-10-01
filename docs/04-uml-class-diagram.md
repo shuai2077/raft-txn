@@ -1,5 +1,7 @@
 # 04 — Architecture: UML class diagrams
 
+> 中文版：[`04-uml-class-diagram.zh-CN.md`](04-uml-class-diagram.zh-CN.md)
+
 This document is the structural companion to docs/01–03. Those explain *why* the
 system is built the way it is; this one shows *what the parts are and how they fit
 together*.
@@ -974,7 +976,7 @@ this document.
 Checks 1 is reproducible from the repository:
 
 ```sh
-node tools/mermaid-check/check.js docs/04-uml-class-diagram.md
+node tools/doc-check/check-mermaid.js docs/04-uml-class-diagram.md
 ```
 
 It takes a markdown file, validates every fenced `mermaid` block, and exits non-zero

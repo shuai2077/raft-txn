@@ -1,5 +1,7 @@
 # 03 — The read barrier, and the lease-rollback race
 
+> 中文版：[`03-read-barrier.zh-CN.md`](03-read-barrier.zh-CN.md)
+
 This document covers two things that turned out to be one investigation:
 
 1. **The read barrier** — implemented, with its correctness argument and the

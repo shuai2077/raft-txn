@@ -1,5 +1,7 @@
 # Analysis of `eliben/raft`: architecture and key mechanisms
 
+> 中文版：[`01-raft-analysis.zh-CN.md`](01-raft-analysis.zh-CN.md)
+
 This document analyses the upstream project
 [`github.com/eliben/raft`](https://github.com/eliben/raft) — an instructional
 implementation of the Raft consensus algorithm in Go — and is the reference for

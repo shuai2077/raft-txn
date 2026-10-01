@@ -94,9 +94,13 @@ go run ./cmd/demo
 | `tso/` | A Raft-replicated timestamp oracle |
 | `cluster/` | Wiring for a whole Multi-Raft cluster, plus fault injection |
 | `docs/` | [Raft analysis](docs/01-raft-analysis.md) · [transaction design](docs/02-transaction-design.md) · [read barrier](docs/03-read-barrier.md) · [UML class diagrams](docs/04-uml-class-diagram.md) |
-| `tools/` | Small helper scripts (`mermaid-check` validates the diagrams in `docs/`) |
+| `tools/` | Small helper scripts (`doc-check` validates the diagrams in `docs/` and the structure of the translations) |
 | `cmd/demo/` | A runnable demonstration |
 | `README.zh-CN.md` | This README in Chinese |
+
+Every document under `docs/` also has a Chinese translation, named after the
+original with a `.zh-CN.md` suffix — for example
+[`docs/02-transaction-design.zh-CN.md`](docs/02-transaction-design.zh-CN.md).
 
 ## How it works, in one page
 
@@ -141,6 +145,9 @@ timestamps may be wasted but are never repeated.
 
 ## Design documentation
 
+**[docs/README.md](docs/README.md)** is the index — it lists the four documents with
+their Chinese versions and a suggested reading order. The documents themselves:
+
 * **[docs/01-raft-analysis.md](docs/01-raft-analysis.md)** — a detailed analysis
   of the upstream `eliben/raft` project: its architecture, the election and
   replication mechanisms, the two Part-3 optimisations, the KV service's commit
@@ -161,6 +168,11 @@ timestamps may be wasted but are never repeated.
   view: layer dependencies, UML class diagrams for every package, the commit path as
   a sequence diagram, and a note on how the diagrams were validated. Start here if
   you want to know what the parts are before reading why they are shaped that way.
+
+Each of the four also has a Chinese translation, named after the original with a
+`.zh-CN.md` suffix. The translations are checked rather than trusted: a script
+verifies that code blocks, mermaid diagrams, headings, links and inline `code spans`
+all survived the translation intact.
 
 ## Status and limits
 

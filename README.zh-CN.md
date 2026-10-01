@@ -88,10 +88,11 @@ go run ./cmd/demo
 | `tso/` | 基于 Raft 复制的授时服务（timestamp oracle） |
 | `cluster/` | 整个 Multi-Raft 集群的装配，以及故障注入 |
 | `docs/` | [Raft 分析](docs/01-raft-analysis.md) · [事务设计](docs/02-transaction-design.md) · [读屏障](docs/03-read-barrier.md) · [UML 类图](docs/04-uml-class-diagram.md) |
-| `tools/` | 小型辅助脚本（`mermaid-check` 用于校验 `docs/` 中的图） |
+| `tools/` | 小型辅助脚本（`doc-check` 用于校验 `docs/` 中的图，并校验译文结构） |
 | `cmd/demo/` | 可直接运行的演示程序 |
 
-> 注：`docs/` 下的三份设计文档目前只有英文版。
+> 注：`docs/` 下的四份设计文档均提供中文版，文件名为同名加 `.zh-CN.md` 后缀，
+> 例如 [`docs/02-transaction-design.zh-CN.md`](docs/02-transaction-design.zh-CN.md)。
 
 ## 一页读懂实现原理
 
@@ -131,6 +132,9 @@ go run ./cmd/demo
 
 ## 设计文档
 
+**[docs/README.md](docs/README.md)** 是索引 —— 它列出四份文档及其中文版，并给出建议的阅读
+顺序。文档本身：
+
 * **[docs/01-raft-analysis.md](docs/01-raft-analysis.md)** —— 对上游 `eliben/raft` 项目的
   详细分析：整体架构、选举与日志复制机制、Part 3 的两项优化、KV 服务的提交订阅机制、
   exactly-once 投递，以及该设计有意省略的内容。文中还逐一列出了本仓库对 Raft 核心所做的
@@ -145,6 +149,10 @@ go run ./cmd/demo
 * **[docs/04-uml-class-diagram.md](docs/04-uml-class-diagram.md)** —— 结构视图：分层依赖、
   每个包的 UML 类图、以时序图给出的提交流程，以及图表本身的校验方式说明。如果你想先了解
   系统由哪些部件构成，再去看它们为何被设计成这样，从这里开始。
+
+四份文档都提供中文版，文件名为原名加 `.zh-CN.md` 后缀。译文是被**校验**过的，而不是被
+信任的：有一个脚本会核对代码块、mermaid 图、标题层级、链接与行内 `code span` 是否在翻译中
+完整保留。
 
 ## 现状与局限
 

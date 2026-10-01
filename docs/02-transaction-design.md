@@ -1,5 +1,7 @@
 # Design: ACID transactions on a Multi-Raft store
 
+> 中文版：[`02-transaction-design.zh-CN.md`](02-transaction-design.zh-CN.md)
+
 This document explains what was fused into `eliben/raft` and, more importantly,
 *why* each piece is shaped the way it is. It is written to be read alongside the
 code: every section names the file that implements it.
@@ -169,14 +171,23 @@ The rules, implemented in `txn.Client.resolveLock` and `txn.DefaultResolver`:
 | the lock record itself carries a `CommitTS` | the owner committed: **publish** this write |
 | the primary's transaction state is `committed` | committed: **publish** |
 | the primary's transaction state is `aborted` | dead: **discard** |
-| the primary group has no record of the transaction | rolled back and forgotten: **discard** |
-| primary is still `prepared`, lease live | owner may still be committing: **wait**, then re-probe |
-| primary is still `prepared`, lease expired | coordinator is gone: **discard** the primary and this lock |
+| primary is still `prepared`, lease live | the owner is entitled to finish: **wait**, then re-probe |
+| primary is still `prepared`, lease lapsed | the owner is not refreshing it: **ask the primary group to record an abort** |
+| the primary group has no record of the transaction | no decision and no lock to respect: **ask it to record an abort** |
 
-The invariant that enforces the safety property:
+The last two rows are compare-and-abort, not inference, and the distinction is
+load-bearing. Before that change the rule was "lease expired, so the coordinator is
+gone: discard", and it lost committed writes: a lease says only that the owner has
+stopped refreshing the lock, not that it can no longer seal the commit point. The
+primary group re-checks its own state when asked, so it answers `committed` if the
+owner won the race and records `aborted` otherwise. See `docs/03-read-barrier.md` §2.
 
-> A reader never discards a lock without first consulting the transaction's
-> **primary** lock, whose group is the only authority on the transaction's fate.
+The safety property that all of this enforces:
+
+> A reader never discards a lock without first establishing, **through the
+> primary's group**, that the owning transaction can no longer commit. The primary
+> group is the only authority on that, and the answer must be a decision recorded
+> through Raft rather than an inference from a clock.
 
 Note what the resolver does *not* do: it does not decide based on the age of the
 lock it tripped over. That lock's age says nothing about whether its transaction
@@ -256,11 +267,19 @@ Raft entry, one atomic state transition.
 ### 7.3 Leases as the liveness mechanism
 
 There is no distributed deadlock detector, and no coordinator heartbeat. A lock
-simply carries `ExpiresAt`, and an expired lock whose primary is undecided may be
-discarded by anyone. A crashed coordinator therefore costs *latency* bounded by
-the lease — never correctness, and never permanent unavailability. The
-alternative (a membership-based liveness service) would be a second consensus
-system to reason about.
+simply carries `ExpiresAt`. A reader that trips over a lapsed lock asks the primary
+group to record an abort, and only once that decision exists may it discard the
+lock; until then it waits. A crashed coordinator therefore costs *latency* bounded
+by the lease, never permanent unavailability.
+
+The lease deliberately does **not** by itself authorise a rollback. Treating "the
+lease lapsed" as "the owner is gone" is an inference, and it is unsound: the owner
+may be slow rather than dead, and discarding its secondary write loses a committed
+transaction (docs/03-read-barrier.md §2). The lease bounds how long a reader waits;
+the Raft-ordered decision is what makes the rollback safe. Two mechanisms, two jobs.
+
+The alternative to leases (a membership-based liveness service) would be a second
+consensus system to reason about.
 
 ### 7.4 Visibility is strict, and the read and conflict rules must be complements
 
@@ -370,9 +389,15 @@ a version — is a Raft entry, hence fsynced and majority-replicated before the
 client is answered. Recovery is log replay, and the state machine is
 deterministic, so replay reproduces the state exactly.
 
-**Liveness.** A crashed coordinator's locks lapse with their lease and are
-reclaimed by the next reader. A group without a quorum cannot make progress, but
-neither can it corrupt anything: proposals fail and callers retry.
+**Liveness.** A crashed coordinator's locks lapse with their lease, and the next
+reader that trips over one recovers it — but by *asking*, not by assuming. The
+lease only says the owner has stopped refreshing; it says nothing about whether the
+owner can still seal. So the reader asks the primary group to record an abort, and
+that group refuses if the transaction committed first. Recovery is therefore a
+decision recorded through Raft rather than an inference from a clock (see
+docs/03-read-barrier.md §2 for why the inference lost writes). A group without a
+quorum cannot make progress, but neither can it corrupt anything: proposals fail and
+callers retry.
 
 **The one thing that is not protected:** a coordinator can die *after* the
 primary seal and before finishing the secondaries, leaving locks whose
