@@ -93,7 +93,8 @@ go run ./cmd/demo
 | `txnservice/` | One Raft group as an HTTP service, and the client that reaches it |
 | `tso/` | A Raft-replicated timestamp oracle |
 | `cluster/` | Wiring for a whole Multi-Raft cluster, plus fault injection |
-| `docs/` | [Raft analysis](docs/01-raft-analysis.md) · [transaction design](docs/02-transaction-design.md) · [read barrier](docs/03-read-barrier.md) |
+| `docs/` | [Raft analysis](docs/01-raft-analysis.md) · [transaction design](docs/02-transaction-design.md) · [read barrier](docs/03-read-barrier.md) · [UML class diagrams](docs/04-uml-class-diagram.md) |
+| `tools/` | Small helper scripts (`mermaid-check` validates the diagrams in `docs/`) |
 | `cmd/demo/` | A runnable demonstration |
 | `README.zh-CN.md` | This README in Chinese |
 
@@ -156,6 +157,10 @@ timestamps may be wasted but are never repeated.
   was found while investigating it — including the fix, which makes recovery a
   compare-and-abort recorded through Raft rather than an inference from a lapsed
   lease.
+* **[docs/04-uml-class-diagram.md](docs/04-uml-class-diagram.md)** — the structural
+  view: layer dependencies, UML class diagrams for every package, the commit path as
+  a sequence diagram, and a note on how the diagrams were validated. Start here if
+  you want to know what the parts are before reading why they are shaped that way.
 
 ## Status and limits
 

@@ -87,7 +87,8 @@ go run ./cmd/demo
 | `txnservice/` | 把单个 Raft 组暴露为 HTTP 服务，以及访问它的客户端 |
 | `tso/` | 基于 Raft 复制的授时服务（timestamp oracle） |
 | `cluster/` | 整个 Multi-Raft 集群的装配，以及故障注入 |
-| `docs/` | [Raft 分析](docs/01-raft-analysis.md) · [事务设计](docs/02-transaction-design.md) · [读屏障](docs/03-read-barrier.md) |
+| `docs/` | [Raft 分析](docs/01-raft-analysis.md) · [事务设计](docs/02-transaction-design.md) · [读屏障](docs/03-read-barrier.md) · [UML 类图](docs/04-uml-class-diagram.md) |
+| `tools/` | 小型辅助脚本（`mermaid-check` 用于校验 `docs/` 中的图） |
 | `cmd/demo/` | 可直接运行的演示程序 |
 
 > 注：`docs/` 下的三份设计文档目前只有英文版。
@@ -141,6 +142,9 @@ go run ./cmd/demo
   什么、用日志位置给出的论证、它**刻意不提供**的保证，以及在排查过程中发现的租约回滚竞态
   —— 包括修复方案：把恢复做成通过 Raft 记录的 compare-and-abort，而不是从租约过期去**推断**
   事务已死。
+* **[docs/04-uml-class-diagram.md](docs/04-uml-class-diagram.md)** —— 结构视图：分层依赖、
+  每个包的 UML 类图、以时序图给出的提交流程，以及图表本身的校验方式说明。如果你想先了解
+  系统由哪些部件构成，再去看它们为何被设计成这样，从这里开始。
 
 ## 现状与局限
 
