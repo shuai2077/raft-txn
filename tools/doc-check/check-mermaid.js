@@ -151,12 +151,121 @@ function validateSequence(block) {
   return { kind: 'sequenceDiagram', nodes: actors.size };
 }
 
+// --- flowchart ---------------------------------------------------------------
+// Supports the subset this repository's documents use: an optional direction,
+// subgraph/end blocks, node definitions with [] or () or (()) shapes, edge
+// statements with optional |labels| or : labels, and %% comments.
+//
+// It deliberately does not implement the whole flowchart grammar. It checks the
+// constructs that appear, and reports anything it does not recognise rather than
+// silently accepting it - which is the point of the exercise.
+function validateFlowchart(block) {
+  const lines = block.body.replace(/\r/g, '').split('\n');
+  const head = lines[0].trim();
+  if (!/^flowchart(\s+(TB|TD|BT|LR|RL))?$/.test(head)) {
+    errors.push(`${file}:${block.line}: first line must be "flowchart [direction]", got ${JSON.stringify(head)}`);
+    return null;
+  }
+  const nodes = new Set();
+  let depth = 0;
+  const nodeToken = /([A-Za-z_][\w]*)(?:\[[^\]]*\]|\([^)]*\)|\{\{[^}]*\}\}|\[\([^)]*\)\]|>([^\]]*)\])?/g;
+
+  // An identifier used on a subgraph line is a subgraph id, not a node.
+  const collectNodes = (text) => {
+    let m;
+    nodeToken.lastIndex = 0;
+    while ((m = nodeToken.exec(text)) !== null) nodes.add(m[1]);
+  };
+
+  for (let i = 1; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = raw.trim();
+    const at = block.line + i;
+    if (line === '' || line.startsWith('%%')) continue;
+
+    if (/^subgraph\s+\S/.test(line)) { depth++; continue; }
+    if (line === 'end') {
+      if (depth === 0) errors.push(`${file}:${at}: "end" without a matching subgraph`);
+      else depth--;
+      continue;
+    }
+    if (/^(linkStyle|classDef|class|style)\b/.test(line)) continue;
+
+    // An edge line: one or more links, optionally with |label| or : label.
+    if (/--?>|---|==>|-\.->/.test(line)) {
+      // Strip edge labels so their contents are not parsed as nodes.
+      const stripped = line
+        .replace(/\|[^|]*\|/g, '')
+        .replace(/:\s*[^:]*$/, '')
+        .replace(/\s*--\s*[^-]*\s*-->/g, '-->');
+      collectNodes(stripped);
+      // Each link must have something on both sides.
+      const parts = stripped.split(/--?>|---|==>|-\.->/).map((p) => p.trim()).filter(Boolean);
+      if (parts.length < 2) {
+        errors.push(`${file}:${at}: edge line has fewer than two endpoints: ${JSON.stringify(line)}`);
+      }
+      continue;
+    }
+
+    // A bare node declaration, possibly several separated by nothing else.
+    if (/^[A-Za-z_][\w]*(\[[^\]]*\]|\([^)]*\)|\{\{[^}]*\}\})?$/.test(line)) {
+      collectNodes(line);
+      continue;
+    }
+    errors.push(`${file}:${at}: unrecognised flowchart line ${JSON.stringify(line)}`);
+  }
+  if (depth !== 0) errors.push(`${file}:${block.line + lines.length}: ${depth} unclosed subgraph(s)`);
+  return { kind: 'flowchart', nodes: nodes.size };
+}
+
+// --- stateDiagram-v2 ---------------------------------------------------------
+function validateStateDiagram(block) {
+  const lines = block.body.replace(/\r/g, '').split('\n');
+  const head = lines[0].trim();
+  if (!/^stateDiagram(-v2)?$/.test(head)) {
+    errors.push(`${file}:${block.line}: first line must be "stateDiagram-v2", got ${JSON.stringify(head)}`);
+    return null;
+  }
+  const states = new Set();
+  let depth = 0;
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const at = block.line + i;
+    if (line === '' || line.startsWith('%%')) continue;
+    if (line.startsWith('direction ')) continue;
+
+    if (/^state\s+/.test(line)) {
+      const m = line.match(/^state\s+"?([^"{]+)"?\s*\{?$/);
+      if (m) states.add(m[1].trim());
+      if (line.endsWith('{')) depth++;
+      continue;
+    }
+    if (line === '}') {
+      if (depth === 0) errors.push(`${file}:${at}: "}" without a matching state block`);
+      else depth--;
+      continue;
+    }
+    // A transition: A --> B [: label]
+    const m = line.match(/^(\[\*\]|[A-Za-z_][\w]*)\s*-->\s*(\[\*\]|[A-Za-z_][\w]*)\s*(?::\s*.+)?$/);
+    if (m) {
+      [m[1], m[2]].forEach((s) => { if (s !== '[*]') states.add(s); });
+      continue;
+    }
+    errors.push(`${file}:${at}: unrecognised state-diagram line ${JSON.stringify(line)}`);
+  }
+  if (depth !== 0) errors.push(`${file}:${block.line + lines.length}: unclosed state block`);
+  return { kind: 'stateDiagram', nodes: states.size };
+}
+
 const stats = [];
 blocks.forEach((b, idx) => {
   const head = b.body.replace(/\r/g, '').split('\n')[0].trim();
   let s = null;
   if (head === 'classDiagram') s = validateClass(b);
   else if (head === 'sequenceDiagram') s = validateSequence(b);
+  else if (/^flowchart(\s|$)/.test(head)) s = validateFlowchart(b);
+  else if (/^stateDiagram(-v2)?$/.test(head)) s = validateStateDiagram(b);
   else errors.push(`${file}:${b.line}: unknown diagram type ${JSON.stringify(head)}`);
   if (s) stats.push({ idx: idx + 1, ...s });
 });

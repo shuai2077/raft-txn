@@ -79,19 +79,62 @@ if (fo.length !== ft.length) {
       continue;
     }
     if (a.lang === 'mermaid') {
-      if (a.body !== b.body) {
-        problems.push(`block ${k + 1} (mermaid): must be byte-identical but differs`);
-        const al = a.body.split('\n'), bl = b.body.split('\n');
-        for (let n = 0; n < Math.max(al.length, bl.length); n++) {
-          if (al[n] !== bl[n]) {
-            problems.push(`    first diff at inner line ${n + 1}:`);
-            problems.push(`      original:    ${JSON.stringify(al[n])}`);
-            problems.push(`      translation: ${JSON.stringify(bl[n])}`);
-            break;
+      const kind = a.body.trim().split('\n')[0].trim();
+      // classDiagram describes the code, so its content is identical in every
+      // language: byte equality is the right check.
+      const isCodeDiagram = /^classDiagram$/.test(kind);
+      if (isCodeDiagram) {
+        if (a.body !== b.body) {
+          problems.push(`block ${k + 1} (mermaid ${kind}): must be byte-identical but differs`);
+          const al = a.body.split('\n'), bl = b.body.split('\n');
+          for (let n = 0; n < Math.max(al.length, bl.length); n++) {
+            if (al[n] !== bl[n]) {
+              problems.push(`    first diff at inner line ${n + 1}:`);
+              problems.push(`      original:    ${JSON.stringify(al[n])}`);
+              problems.push(`      translation: ${JSON.stringify(bl[n])}`);
+              break;
+            }
           }
+        } else {
+          notes.push(`block ${k + 1} (mermaid ${kind}): identical`);
         }
+        continue;
+      }
+
+      // Everything else carries prose labels (flowchart boxes, state names,
+      // sequence participants and messages), which a translation SHOULD change.
+      // So drop exactly the label text and compare the rest byte for byte: node
+      // ids, arrows, brackets and line structure must all be preserved. A
+      // deliberately narrow strip is what makes this a real check - comparing bare
+      // skeletons would let a reversed edge (`A->>B` vs `B->>A`) through.
+      const unlabel = (body) => body.split('\n').map((l) => l
+        // Forms that put the label behind a keyword, so the id must be kept and
+        // only the label replaced.
+        .replace(/^(\s*subgraph\s+\S+)\s*\[.*\]\s*$/, '$1[L]')
+        .replace(/^(\s*subgraph\s+\S+)\s+"[^"]*"\s*$/, '$1 "L"')
+        .replace(/^(\s*(?:participant|actor)\s+\S+)\s+as\s+.*$/, '$1 as L')
+        // A label that a translation may change, in each form the documents use:
+        .replace(/(:\s*).*$/, '$1L')                  // after a colon (messages, transitions)
+        .replace(/\|[^|]*\|/g, '|L|')                 // |edge label|
+        .replace(/\["[^"]*"\]/g, '["L"]')             // ["node label"]
+        .replace(/\(\([^)]*\)\)/g, '((L))')           // ((label))
+        .replace(/\([^)]*\)/g, '(L)')                 // (label)
+        // A bracketed label with no quotes is only stripped when it contains a
+        // space or non-identifier characters, so `[Store]` (an id) survives.
+        .replace(/\[([^\]"]*[^\w\]][^\]"]*)\]/g, '[L]')
+        .replace(/"[^"]*"/g, '"L"'));
+      const so = unlabel(a.body), st = unlabel(b.body);
+      let diff = -1;
+      for (let n = 0; n < so.length; n++) {
+        if (so[n] !== st[n]) { diff = n; break; }
+      }
+      if (diff >= 0) {
+        problems.push(`block ${k + 1} (mermaid ${kind}): structure differs at inner line ${diff + 1} ` +
+          `(node ids, arrows and brackets must not change; only labels may)`);
+        problems.push(`      original:    ${JSON.stringify(a.body.split('\n')[diff])}`);
+        problems.push(`      translation: ${JSON.stringify(b.body.split('\n')[diff])}`);
       } else {
-        notes.push(`block ${k + 1} (mermaid): identical`);
+        notes.push(`block ${k + 1} (mermaid ${kind}): structure identical, ${a.lines} lines`);
       }
     } else if (a.lines !== b.lines) {
       problems.push(`block ${k + 1} (${a.lang || 'plain'}): line count differs ` +
@@ -204,16 +247,28 @@ const st = spans(trans);
 // written inside backticks, as in `04-uml-class-diagram.zh-CN.md`. Reuse the same
 // narrow exclusion the link check uses.
 const isCrossLinkSpan = (s) => /^[\w.\-]+\.md$/.test(s) && isCrossLink(s);
-const smissing = [...so].filter((s) => !st.has(s) && !isCrossLinkSpan(s) && !/\.zh-CN\.md$/.test(s));
+// An inline span used as running prose inside code formatting - `map[日志索引]结果channel`
+// on one side, `map[log index]result channel` on the other - is meant to be
+// translated, so requiring the span itself to survive would flag a correct
+// translation. The test is deliberately conservative: a span is excused only when
+// it contains CJK, or a space, or a slash-separated multi-word phrase. No Go
+// identifier contains a space, so identifiers are still compared strictly.
+const isProseSpan = (s) =>
+  /[\u3400-\u9fff\uf900-\ufaff]/.test(s) || /\s/.test(s);
+const smissing = [...so].filter((s) =>
+  !st.has(s) && !isCrossLinkSpan(s) && !/\.zh-CN\.md$/.test(s) && !isProseSpan(s));
 if (smissing.length) {
   problems.push(`inline code spans missing from translation (${smissing.length} of ${so.size}):`);
   smissing.slice(0, 25).forEach((s) => problems.push(`    ${JSON.stringify(s)}`));
 }
-const sextra = [...st].filter((s) => !so.has(s) && !isCrossLinkSpan(s) && !/\.zh-CN\.md$/.test(s));
+const sextra = [...st].filter((s) =>
+  !so.has(s) && !isCrossLinkSpan(s) && !/\.zh-CN\.md$/.test(s) && !isProseSpan(s));
 if (sextra.length) {
   problems.push(`inline code spans present only in the translation (${sextra.length} of ${st.size}):`);
   sextra.slice(0, 25).forEach((s) => problems.push(`    ${JSON.stringify(s)}`));
 }
+const proseSpans = [...so].filter(isProseSpan).length + [...st].filter(isProseSpan).length;
+if (proseSpans) notes.push(`${proseSpans} prose code span(s) excluded from the comparison (they are translated)`);
 
 // --- report ------------------------------------------------------------------
 const oLines = orig.split('\n').length;

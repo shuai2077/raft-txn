@@ -87,11 +87,11 @@ go run ./cmd/demo
 | `txnservice/` | 把单个 Raft 组暴露为 HTTP 服务，以及访问它的客户端 |
 | `tso/` | 基于 Raft 复制的授时服务（timestamp oracle） |
 | `cluster/` | 整个 Multi-Raft 集群的装配，以及故障注入 |
-| `docs/` | [Raft 分析](docs/01-raft-analysis.md) · [事务设计](docs/02-transaction-design.md) · [读屏障](docs/03-read-barrier.md) · [UML 类图](docs/04-uml-class-diagram.md) |
+| `docs/` | [Raft 分析](docs/01-raft-analysis.md) · [事务设计](docs/02-transaction-design.md) · [读屏障](docs/03-read-barrier.md) · [UML 类图](docs/04-uml-class-diagram.md) · [工作流程分析](docs/05-workflow-analysis.zh-CN.md) |
 | `tools/` | 小型辅助脚本（`doc-check` 用于校验 `docs/` 中的图，并校验译文结构） |
 | `cmd/demo/` | 可直接运行的演示程序 |
 
-> 注：`docs/` 下的四份设计文档均提供中文版，文件名为同名加 `.zh-CN.md` 后缀，
+> 注：`docs/` 下的五份设计文档均提供中文版，文件名为同名加 `.zh-CN.md` 后缀，
 > 例如 [`docs/02-transaction-design.zh-CN.md`](docs/02-transaction-design.zh-CN.md)。
 
 ## 一页读懂实现原理
@@ -132,7 +132,7 @@ go run ./cmd/demo
 
 ## 设计文档
 
-**[docs/README.md](docs/README.md)** 是索引 —— 它列出四份文档及其中文版，并给出建议的阅读
+**[docs/README.md](docs/README.md)** 是索引 —— 它列出五份文档及其中文版，并给出建议的阅读
 顺序。文档本身：
 
 * **[docs/01-raft-analysis.md](docs/01-raft-analysis.md)** —— 对上游 `eliben/raft` 项目的
@@ -149,8 +149,12 @@ go run ./cmd/demo
 * **[docs/04-uml-class-diagram.md](docs/04-uml-class-diagram.md)** —— 结构视图：分层依赖、
   每个包的 UML 类图、以时序图给出的提交流程，以及图表本身的校验方式说明。如果你想先了解
   系统由哪些部件构成，再去看它们为何被设计成这样，从这里开始。
+* **[docs/05-workflow-analysis.zh-CN.md](docs/05-workflow-analysis.zh-CN.md)** —— 行为视图：
+  按**模块关联关系**展开的工作流程分析 —— 模块边界、每个模块通过哪个接口与谁通信，以及写
+  流程与读流程的逐步拆解。与 `04` 互补：`04` 回答「有哪些部件」，`05` 回答「运行时这些部件
+  如何协作」。
 
-四份文档都提供中文版，文件名为原名加 `.zh-CN.md` 后缀。译文是被**校验**过的，而不是被
+五份文档都提供中文版，文件名为原名加 `.zh-CN.md` 后缀。译文是被**校验**过的，而不是被
 信任的：有一个脚本会核对代码块、mermaid 图、标题层级、链接与行内 `code span` 是否在翻译中
 完整保留。
 

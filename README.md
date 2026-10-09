@@ -93,7 +93,7 @@ go run ./cmd/demo
 | `txnservice/` | One Raft group as an HTTP service, and the client that reaches it |
 | `tso/` | A Raft-replicated timestamp oracle |
 | `cluster/` | Wiring for a whole Multi-Raft cluster, plus fault injection |
-| `docs/` | [Raft analysis](docs/01-raft-analysis.md) · [transaction design](docs/02-transaction-design.md) · [read barrier](docs/03-read-barrier.md) · [UML class diagrams](docs/04-uml-class-diagram.md) |
+| `docs/` | [Raft analysis](docs/01-raft-analysis.md) · [transaction design](docs/02-transaction-design.md) · [read barrier](docs/03-read-barrier.md) · [UML class diagrams](docs/04-uml-class-diagram.md) · [workflow analysis](docs/05-workflow-analysis.md) |
 | `tools/` | Small helper scripts (`doc-check` validates the diagrams in `docs/` and the structure of the translations) |
 | `cmd/demo/` | A runnable demonstration |
 | `README.zh-CN.md` | This README in Chinese |
@@ -145,7 +145,7 @@ timestamps may be wasted but are never repeated.
 
 ## Design documentation
 
-**[docs/README.md](docs/README.md)** is the index — it lists the four documents with
+**[docs/README.md](docs/README.md)** is the index — it lists the five documents with
 their Chinese versions and a suggested reading order. The documents themselves:
 
 * **[docs/01-raft-analysis.md](docs/01-raft-analysis.md)** — a detailed analysis
@@ -168,8 +168,14 @@ their Chinese versions and a suggested reading order. The documents themselves:
   view: layer dependencies, UML class diagrams for every package, the commit path as
   a sequence diagram, and a note on how the diagrams were validated. Start here if
   you want to know what the parts are before reading why they are shaped that way.
+* **[docs/05-workflow-analysis.md](docs/05-workflow-analysis.md)** — the behavioural
+  view: the workflow analysed through **module associations** — module boundaries,
+  what each module talks to and through which interface, and the write and read flows
+  decomposed into numbered steps naming the module, the call, and the data structure
+  that crosses the boundary. Where `04` says which parts exist, this says how they
+  cooperate at run time.
 
-Each of the four also has a Chinese translation, named after the original with a
+Each of the five also has a Chinese translation, named after the original with a
 `.zh-CN.md` suffix. The translations are checked rather than trusted: a script
 verifies that code blocks, mermaid diagrams, headings, links and inline `code spans`
 all survived the translation intact.
