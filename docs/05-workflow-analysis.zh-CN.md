@@ -211,7 +211,7 @@ flowchart TB
 ### 4.1 LogEntry / CommitEntry
 
 ```go
-// internal/raft/raft.go
+// internal/raft/raft.go -- simplified
 type LogEntry struct {
     Command any
     Term    int
@@ -234,7 +234,7 @@ type CommitEntry struct {
 ### 4.2 Server
 
 ```go
-// internal/raft/server.go
+// internal/raft/server.go -- simplified
 type Server struct {
     serverId    int
     peerIds     []int
@@ -264,7 +264,7 @@ type Server struct {
 ### 4.3 ConsensusModule（节点状态机）
 
 ```go
-// internal/raft/raft.go
+// internal/raft/raft.go -- simplified
 type ConsensusModule struct {
     id        int
     peerIds   []int
@@ -313,7 +313,7 @@ type ConsensusModule struct {
 ### 4.4 StateMachineHandler（层间唯一的出向接口）
 
 ```go
-// internal/raft/raft.go
+// internal/raft/raft.go -- simplified
 type StateMachineHandler interface {
     Apply(command any) any
 }
@@ -337,15 +337,20 @@ type proposalResult struct {
 ### 4.6 Storage
 
 ```go
-// internal/raft/storage.go
+// internal/raft/storage.go -- simplified
 type Storage interface {
-    Set(key string, value any)
-    Get(key string) (any, bool)
+    Set(key string, value []byte)
+    Get(key string) ([]byte, bool)
+    HasData() bool
 }
 ```
 
-持久化接口，`MapStorage` 是内存实现。上游的实现每次变更都把**整个日志** gob 编码后写入，
-是日志长度的平方级开销 —— 这是已知且被有意保留的简化。
+持久化接口，`MapStorage` 是内存实现。注意值是 `[]byte` 而不是 `any`：状态机层面虽然允许
+任意 Go 值，但**持久化层面只认字节**，因为算法层要自己决定序列化格式 ——
+`persistToStorage` 用 `gob` 把 `currentTerm`、`votedFor` 和**整个日志**分别编码后写入三个键。
+
+上游的实现每次变更都把整个日志重新 gob 编码后写入，是日志长度的平方级开销 —— 这是已知
+且被有意保留的简化。
 
 ---
 
@@ -354,7 +359,7 @@ type Storage interface {
 ### 5.1 txnservice.Node（组服务）
 
 ```go
-// txnservice/service.go
+// txnservice/service.go -- simplified
 type Node struct {
     cfg     NodeConfig
     groupID txn.GroupID
@@ -385,7 +390,7 @@ raftServer.SetHandler(store)           挂上状态机钩子
 ### 5.2 txn.RaftLog（层间适配器）
 
 ```go
-// txn/raftadapter.go
+// txn/raftadapter.go -- simplified
 type RaftLog struct {
     server  *raft.Server
     groupID GroupID
@@ -407,7 +412,7 @@ type RaftLog struct {
 ### 5.3 txn.Store（数据状态机）
 
 ```go
-// txn/store.go
+// txn/store.go -- simplified
 type Store struct {
     log       Log
     lockTTL   time.Duration
@@ -434,7 +439,7 @@ type Store struct {
 ### 5.4 txn.Client 与 txn.Txn（协调器与事务句柄）
 
 ```go
-// txn/client.go
+// txn/client.go -- simplified
 type Client struct {
     oracle       Oracle
     partitioner  Partitioner
@@ -467,7 +472,7 @@ type Txn struct {
 ### 5.5 txn.TxnCommand（跨组协议的命令词汇）
 
 ```go
-// txn/command.go
+// txn/command.go -- simplified
 type TxnCommand struct {
     Kind TxnCommandKind
     ReadArgs        *ReadArgs
@@ -515,12 +520,15 @@ type TxnCommand struct {
 这是算法层与应用层之间**唯一的入向边界**，值得逐步展开：
 
 ```go
-// internal/raft/server.go —— 已简化，保留结构与注释
+// internal/raft/server.go —— Apply（已简化，保留结构与注释）
 index := cm.propose(cmd)                    // (1) 追加日志，拿到索引
 ch := make(chan proposalResult, 1)          // (2) 建结果 channel（缓冲 1）
 cm.results[index] = ch                      // (3) 登记关联：索引 → channel
 if cm.commitIndex >= index {                // (4) 若已提交，催一次应用者
-    select { case cm.newCommitReadyChan <- struct{}{}: default: }
+    select {
+    case cm.newCommitReadyChan <- struct{}{}:
+    default:
+    }
 }
 cm.mu.Unlock()                              // (5) 放锁，然后等
 select {
@@ -533,23 +541,40 @@ case <-timer.C:                             // (6c) 超时（无多数派）
 对应地在算法层的应用侧：
 
 ```go
-// internal/raft/raft.go —— commitChanSender
+// internal/raft/raft.go —— commitChanSender（已简化，仅保留循环体）
 for range cm.newCommitReadyChan {
     cm.mu.Lock()
-    entries := cm.log[cm.lastApplied+1 : cm.commitIndex+1]  // 取新提交的条目
+    entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]   // 取新提交的条目
     cm.lastApplied = cm.commitIndex
     handler := cm.handler
     cm.mu.Unlock()                                          // 关键：放锁再应用
 
     for i, entry := range entries {
-        result := handler.Apply(entry.Command)              // 应用数据状态机
+        var result any
+        if handler != nil {
+            result = handler.Apply(entry.Command)           // 应用数据状态机
+        }
+
         cm.mu.Lock()
         if ch, ok := cm.results[index]; ok {                // 找到提议者
             delete(cm.results, index)
             cm.mu.Unlock()
-            select { case ch <- proposalResult{value: result}: default: }
-        } else { cm.mu.Unlock() }
-        select { case cm.commitChan <- CommitEntry{...}: case <-cm.stopChan: }
+            select {
+            case ch <- proposalResult{value: result, err: applyErr}:
+            default:
+            }
+        } else {
+            cm.mu.Unlock()
+        }
+        select {
+        case cm.commitChan <- CommitEntry{
+            Command: entry.Command,
+            Index:   index,
+            Term:    savedTerm,
+        }:
+        case <-cm.stopChan:
+            return
+        }
     }
 }
 ```
@@ -743,7 +768,418 @@ GroupClient.Prewrite        应用层：HTTP 客户端
 
 ---
 
-## 9 本文与参照文章的差异汇总
+## 9 关键代码解析（一）：请求进入共识层之前的六道关
+
+§3.2 提到 `handle*` 并不直接调用 `Store`。这一节把那句话展开：一条 HTTP 请求要真正进入
+Raft 日志，必须依次通过六道关，**每道关都有明确的拒绝理由**。
+
+```go
+// txnservice/service.go
+func (n *Node) propose(w http.ResponseWriter, req *http.Request, cmd txn.TxnCommand,
+	render func(txn.TxnResult) any) {
+	if !n.IsLeader() {
+		// Avoid one wasted log round trip per request by answering with a routing
+		// hint, so the client goes straight to the leader. This is an
+		// optimization, not a consistency requirement: Apply would reject the
+		// command anyway.
+		writeJSON(w, notLeaderPayload(n.LeaderHint(), int(n.groupID)))
+		return
+	}
+
+	res, err := n.log.ApplyCommand(req.Context(), cmd)
+	if err != nil {
+		var notLeader *txn.NotLeaderError
+		if errors.As(err, &notLeader) {
+			writeJSON(w, notLeaderPayload(notLeader.LeaderID, int(notLeader.GroupID)))
+			return
+		}
+		writeJSON(w, internalErrorPayload(err))
+		return
+	}
+	writeJSON(w, render(res))
+}
+```
+
+这二十来行里有三个容易忽略的要点：
+
+1. **`IsLeader()` 自查是纯优化。** 注释说得很直白：即使不查，`Server.Apply` 也会拒绝非
+   leader 的命令（它自己会持锁复查状态）。这一查只是省掉一次注定失败的日志往返。**这一点
+   很重要**：它意味着这条快速路径的正确性不依赖于 `IsLeader()` 的实现质量 —— 它可能给出
+   过期的 `true`，而那种情况下 `ApplyCommand` 会返回 `NotLeaderError`，走下面的分支。
+2. **两条 `not-leader` 分支的语义不同。** 上面那条由 `Node` 自己产生（连日志都没进），下面
+   那条来自 `RaftLog.ApplyCommand` 对 `raft.NotLeaderError` 的翻译。两条都返回 leader 提示，
+   所以客户端无需区分。
+3. **`render` 是延迟执行的。** 命令先被复制并应用，拿到 `TxnResult` 之后才由 `render` 转成
+   具体的响应结构（`WriteResponse` 或 `LockedResponse`）。失败路径根本不构造响应体。
+
+接下来是第六道关 —— `RaftLog.ApplyCommand` 对 `*raft.Server` 的适配：
+
+```go
+// txn/raftadapter.go
+func (rl *RaftLog) ApplyCommand(ctx context.Context, cmd TxnCommand) (TxnResult, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return TxnResult{}, ctx.Err()
+		default:
+		}
+	}
+
+	out, err := rl.server.Apply(cmd)
+	if err != nil {
+		var notLeader *raft.NotLeaderError
+		if errors.As(err, &notLeader) {
+			rl.learnLeader(notLeader.LeaderID)
+			return TxnResult{}, &NotLeaderError{GroupID: rl.groupID, LeaderID: notLeader.LeaderID}
+		}
+		return TxnResult{}, err
+	}
+
+	// A leader that lost leadership between the check and the apply returns nil:
+	// the command was not applied. Report it as a routing failure so the caller
+	// retries against the new leader.
+	if out == nil {
+		return TxnResult{}, &NotLeaderError{GroupID: rl.groupID, LeaderID: rl.LeaderHint()}
+	}
+
+	res, ok := out.(TxnResult)
+	if !ok {
+		return TxnResult{}, fmt.Errorf("txn: group %d: state machine returned %T, want TxnResult",
+			rl.groupID, out)
+	}
+	return res, nil
+}
+```
+
+这是**层间适配的完整内容**：一个类型断言、一次错误翻译、一个边界情形处理。三点值得注意：
+
+- **`out == nil` 不是错误，而是「领导权刚丢」。** 上游的 `Apply` 在某些路径上会静默返回 nil
+  表示命令未被应用。适配器不把它当成空结果，而是翻译成 `NotLeaderError` 让上层重试 —— 若
+  当作成功，协调器就会基于一个**从未发生的写入**继续推进。
+- **`learnLeader` 是提示的本地缓存。** 拿到 `NotLeaderError` 时顺手记下提示的 leader id，
+  下一次 `LeaderHint()` 就能立即给出答案，无需再问 Raft。
+- **类型断言失败被显式报错。** 如果状态机返回的不是 `TxnResult`，说明有别的模块挂上了
+  `StateMachineHandler` —— 这是配置错误，必须响亮地失败。
+
+---
+
+## 10 关键代码解析（二）：事务状态机的三张表
+
+`Store` 的全部数据就是三个 map（§5.3）。它们的**写入时机**完全不同，这正是事务机制的关键：
+
+| 表 | 何时写 | 何时删 | 回答的问题 |
+|---|---|---|---|
+| `versions map[Key][]Version` | `publishVersion`，即**提交**时 | 永不（无垃圾回收） | 快照 S 能看到什么 |
+| `locks map[Key]*LockRecord` | `prewrite`，即**准备**时 | `commit` / `rollback` | 有没有一笔写入正被扣住 |
+| `actors map[TxnID]*Actor` | `actorOrCreate`，准备时创建 | 永不 | 这笔事务决定了没有 |
+
+### 10.1 prewrite：先把两把锁的判定做完，再动状态
+
+```go
+// txn/store.go
+	expiresAt := s.expiresAt()
+
+	// Validate every write before mutating anything, so the group is never left
+	// partially locked by a rejected request. (This mirrors the atomicity
+	// assumption internal/raft makes about its own storage: one log entry, one
+	// state transition.)
+	for _, op := range req.Ops {
+		if res, bad := s.checkPrewriteOp(req, op, expiresAt); bad {
+			return s.memoize(req.TxnID, req.ClientID, req.RequestID, res)
+		}
+	}
+
+	// Commit point: install the intent locks.
+	for _, op := range req.Ops {
+		s.locks[op.Key] = &LockRecord{
+			TxnID:     req.TxnID,
+			StartTS:   req.StartTS,
+			Primary:   req.Primary,
+			Kind:      op.Kind,
+			Value:     op.Value,
+			CommitTS:  0,
+			ExpiresAt: expiresAt,
+		}
+	}
+```
+
+**两步分离是有意的**：先对整批写操作做完全部校验，再统一落锁。注释把它与 `internal/raft`
+的存储原子性假设对应起来 —— 「一条日志条目，一次状态转换」。如果边校验边落锁，一次被拒绝的
+请求就会让该组留下**部分锁定**的状态，而这个状态会被复制到所有副本。
+
+`CommitTS: 0` 是关键：它表示「锁已就位，但事务尚未决定」。**封印**（`seal`）才会写入非零值。
+
+### 10.2 两条判定规则必须严格互补
+
+`checkPrewriteOp` 里有两个判定，它们的关系是整个隔离模型的核心：
+
+```go
+// txn/store.go —— latestVersionAt（已简化） // simplified
+func (s *Store) latestVersionAt(key Key, startTS Timestamp) (Version, bool) {
+	versions := s.versions[key]
+	best := -1
+	for i := range versions {
+		if versions[i].CommitTS < startTS {
+			best = i
+		} else {
+			break
+		}
+	}
+	// ...
+}
+```
+
+```go
+// txn/store.go —— writeConflict（已简化）
+func (s *Store) writeConflict(key Key, startTS Timestamp) (Timestamp, Timestamp, bool) {
+	versions := s.versions[key]
+	if len(versions) == 0 {
+		return 0, 0, false
+	}
+	newest := versions[len(versions)-1]
+	if newest.CommitTS >= startTS {
+		// The newest version is not visible to our snapshot. Report the oldest
+		// such version, which is the one we are in conflict with.
+		for i := range versions {
+			if versions[i].CommitTS >= startTS {
+				return versions[i].StartTS, versions[i].CommitTS, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+```
+
+读用严格的 `<`，冲突用 `>=`。**两者必须互为补集**，否则会出现一条宽度为单个时间戳的缝：
+某个版本对该快照**不可见**，却不**阻止**写入 —— 于是写入者会覆盖一个它从未看见的提交。
+
+这一点在代码里由一条注释明确锁定，也是
+[`docs/02-transaction-design.md`](02-transaction-design.md) §7.4 的主题。值得注意的是，
+`writeConflict` 里那段内层循环取的是**最旧的**冲突版本而不是最新的：报给调用方的应该是
+「你撞上的那一笔」，这样错误信息才有可诊断性。
+
+### 10.3 seal：只写决定，不发布数据
+
+`seal` 是事务的原子提交点，而它**什么都不发布**：
+
+```go
+// txn/store.go —— seal（已简化，保留结构与关键分支）
+	lock.CommitTS = args.CommitTS
+	s.observeCommitTS(args.CommitTS)
+	// Sealing extends the lease: the transaction is now decided, and a reader
+	// should get a chance to see the decision before anybody force-resolves it.
+	lock.ExpiresAt = s.expiresAt()
+
+	actor := s.actorOrCreate(args.TxnID)
+	if actor.Primary == "" {
+		actor.Primary = lock.Primary
+	}
+	// Sealing records the transaction's decision. It is the commit point: the
+	// group now knows the transaction is committed even though the write is not
+	// published yet. The CmdCommit that follows (issued by the coordinator, or by
+	// any reader that discovers this decision) publishes it.
+	if !actor.State.Final() {
+		actor.State = StateCommitted
+	}
+	if actor.CommitTS == 0 {
+		actor.CommitTS = args.CommitTS
+	}
+```
+
+三个效果，每个都有明确用途：
+
+1. **`lock.CommitTS` 非零** → 任何读到这把锁的读者都能立刻得知「已提交」，无需再问主组。
+2. **`actor.State = StateCommitted`** → 主组自己记住了决定，次级锁的读者来问时能得到答案。
+3. **`lock.ExpiresAt` 被延长** → 刚做出决定的事务应该有机会被读出来，而不是立刻被强制解析。
+
+`seal` 之前还挡了一道门 —— **已被中止的事务不能再被封印**（`StatusAlreadyAborted`）。这道
+门与「读者只能在中止决定落盘后才丢弃锁」互为印证：两者都靠**同一条 Raft 日志的先后顺序**
+来决定谁赢，而不是靠时间戳或租约去猜。
+
+### 10.4 commit：幂等且能分辨「刚做完」与「早就做完了」
+
+```go
+// txn/store.go —— commit 的收尾（已简化） // simplified
+		s.publishVersion(key, lock.StartTS, commitTS, lock.Kind, lock.Value)
+		delete(s.locks, key)
+		committed++
+		effectiveTS = commitTS
+	}
+	// ...
+	actor = s.actorOrCreate(req.TxnID)
+	actor.State = StateCommitted
+	if effectiveTS != 0 {
+		actor.CommitTS = effectiveTS
+	}
+
+	types := StatusOK
+	if actor != nil && actor.State == StateCommitted && committed == 0 {
+		// Nothing was published and the decision was already on record: this is a
+		// retry of a commit that has fully landed. Report it as such so callers
+		// can tell "already done" from "just did it".
+		types = StatusAlreadyCommitted
+	}
+```
+
+`publishVersion` 与 `delete(s.locks, key)` 成对出现：**一个版本被发布的同一刻，它的锁消失**。
+这两件事在同一条日志条目里完成，因此对所有副本原子。
+
+`StatusAlreadyCommitted` 与 `StatusOK` 的区分不只是好看：`Commit` 请求在网络上可能被重发，
+协调器需要知道「我这次真的发布了」还是「别人已经发布过了」—— 前者可以清账，后者说明有人
+已经在帮忙收尾。
+
+---
+
+## 11 关键代码解析（三）：事务与共识层的两次握手
+
+§7.2 的八步流程里，第 4 步（prewrite）与第 7 步（seal）是与共识层交互的两个关键点。这一节
+把它们各自的一次完整往返摊开。
+
+### 11.1 第一次握手：prewrite
+
+```
+协调器                                    某个 Raft 组
+────────                                  ────────────
+Txn.prewrite
+ └ Client.prewriteWrites
+    │  primaryKeyOf(writes)               ← 本地算主键，无需协调
+    │  byGroup 按分区器切分写集
+    └ Participant.Prewrite(req)
+       ├─(HTTP 路径) GroupClient.Prewrite
+       │   └ callFor → POST /txn/prewrite/
+       │                                  Node.handlePrewrite → propose
+       │                                   (1) IsLeader 自查
+       └─(进程内路径) RaftLog.Prewrite
+                                        RaftLog.ApplyCommand
+                                         (2) server.Apply(cmd)
+                                          ├ cm.propose：追加日志 + 持久化 + 触发复制
+                                          ├ cm.results[index] = ch
+                                          └ 等 ch
+                                        commitChanSender（条目被多数派复制后）
+                                         (3) handler.Apply(cmd)
+                                          └ Store.Apply → Store.prewrite
+                                              ├ checkPrewriteOp × len(Ops)
+                                              └ 落锁 + actor.State = StatePrepared
+                                         (4) ch <- proposalResult{value: TxnResult}
+       ← WriteResponse{status, prepared}  (5) render(res) → JSON
+```
+
+**每一步的失败模式都不同，这是这个设计值得注意的地方**：
+
+| 步 | 失败时 | 由谁翻译成什么 |
+|---|---|---|
+| (1) | 本节点不是 leader | `Node` 直接返回 `not-leader` + 提示，不产生日志 |
+| (2) | 复查发现已非 leader | `raft.NotLeaderError` → `txn.NotLeaderError` |
+| (2) | 无多数派 | `ApplyTimeout` 后 `abandonProposal`，报「未在时限内提交」 |
+| (3) | 写冲突 / 撞锁 | 返回 `TxnResult` **而不是 error**；业务判定走结果，不走错误 |
+| (4) | 提议者已放弃 | 非阻塞投递被丢弃，应用者不受影响 |
+
+**第 (3) 步的设计取向值得单独强调**：写冲突和锁冲突都是**正常结果**，通过
+`TxnResult.Status` 返回，而不是 Go 的 `error`。这条界线划得很清楚 ——
+
+- `error` 表示**这次 RPC 没能得到一个判定**（路由、超时、停机），调用方应重试；
+- `TxnResult.Status` 表示**得到了判定，判定是不行**（冲突、锁被占），调用方应据此改变行为。
+
+如果把两者混在一起，协调器就无法区分「重试可能成功」和「重试一定失败」。§11.3 会看到
+这个区分如何被直接用在重试决策上。
+
+### 11.2 第二次握手：seal 与 commit
+
+封印走的是与 prewrite 完全相同的通路，只是命令不同：
+
+```
+Txn.commitPrimary(commitTS, prepared)
+ ├ participant.Seal(primaryKey, id, startTS, commitTS)
+ │   └ TxnCommand{Kind: CmdSeal, SealArgs: &SealArgs{...}}
+ │      └ …同 §11.1 的 (2)~(4)…
+ │         Store.seal：lock.CommitTS = commitTS
+ │                    actor.State  = StateCommitted   ← 事务此刻提交
+ │                    lock.ExpiresAt 延长
+ └ participant.Commit(CommitRequest{Keys: [primaryKey]})
+     └ TxnCommand{Kind: CmdCommit, ...}
+        Store.commit：publishVersion + delete(lock)   ← 主键写入可见
+```
+
+**封印与提交是两条独立的日志条目，这个拆分是刻意的。** 两者的代价与后果不同：
+
+- `seal` 只需一条日志、$O(1)$ 状态变更。它决定事务的命运。**它失败时事务是否已提交，取决于
+  它是否已被多数派接受** —— 这正是 `CommitUnknownError` 存在的原因。
+- `commit` 才真正写版本。它需要读取锁记录、按 `CommitTS` 排序追加版本链。**它失败不影响
+  事务已提交这一事实**，因为任何读者都能依据封印的锁自行补完。
+
+因此 `commitPrimary` 的失败被翻译成 `CommitUnknownError`（「已提交，但可能没完成」），而不是
+普通错误：
+
+```go
+	// The atomic commit point.
+	if err := t.commitPrimary(ctx, commitTS, prepared); err != nil {
+		t.state = stateCommitted
+		t.committedTS = commitTS
+		return commitTS, &CommitUnknownError{TxnID: t.id, CommitTS: commitTS, Err: err}
+	}
+```
+
+注意 `t.state = stateCommitted` 是在**返回错误之前**设置的。这看起来反直觉，但它是对的：
+封印一旦被提出，事务就不能再回滚了。后续由 `Txn.Finish` 或任意读者把次级写入补完。
+
+### 11.3 失败处理的完整闭环
+
+把上面两次握手串起来，失败处理的闭环是这样的：
+
+```mermaid
+flowchart TB
+    A["Txn.Commit"] --> B["prewrite 各分组"]
+    B -->|"失败"| C["abortLockedGroups<br/>先中止主组，再退次锁"]
+    B -->|"成功"| D["oracle.CommitTS"]
+    D -->|"失败"| C
+    D -->|"成功"| E["verifyLocksHeld"]
+    E -->|"锁已丢"| C
+    E -->|"锁仍在"| F["Seal（主键）"]
+    F -->|"报错"| G["CommitUnknownError<br/>t.state = committed"]
+    F -->|"成功"| H["Commit 主键 + 各次键"]
+    H -->|"部分失败"| G
+    G --> I["Txn.Finish<br/>用已记录的 commitTS 补发"]
+    C --> J["LockRolledBackError<br/>可重试"]
+    I -->|"成功"| K["完成"]
+    I -->|"失败"| L["读者解析兜底"]
+```
+
+三条出口的含义：
+
+| 出口 | 事务的最终状态 | 调用方该做什么 |
+|---|---|---|
+| 正常成功 | 已提交，全部写入可见 | 继续 |
+| `LockRolledBackError` | **未提交**，无任何写入发布 | 重试整笔事务（新事务、新时间戳） |
+| `CommitUnknownError` | **已提交**，可能有写入未发布 | 调 `Txn.Finish` 补完，**绝不能重试整笔事务** |
+
+**最后一行是这个设计里最容易写错的地方。** 一笔事务一旦封印，重试它就等于让同一批写入被
+应用两次 —— 而它的写集可能是「余额加 1」。`Txn.Finish` 与读者解析的作用正是让「已提交但
+未完成」变成一个**可终止**的状态，而不是需要调用方猜测的状态。
+
+`verifyLocksHeld` 的位置同样关键：它在**取提交时间戳之后、封印之前**：
+
+```go
+// txn/client.go —— Txn.Commit 中的锁校验（已简化，注释行有省略）
+// Every lock must still be in place before the commit point is written.
+// ...
+// Sealing later cannot repair that, so the check has to happen first. If any
+// lock is gone, no commit point has been written and no version published, so
+// the transaction is still entirely invisible and aborting is safe.
+if err := t.verifyLocksHeld(ctx, prepared); err != nil {
+    _ = t.abortLockedGroups(ctx)
+    t.state = stateAborted
+    return 0, err
+}
+```
+
+注释里的推理值得逐句读：**检查必须在封印之前，因为事后封印无法挽回一个已被丢弃的写入**；
+而检查失败时中止是**安全的**，因为提交点尚未写入、没有任何版本被发布 —— 事务仍然完全不可见。
+这两句话合起来，就是 [`docs/03-read-barrier.md`](03-read-barrier.md) §2 那场丢写入竞态的
+修复条件的完整表述。
+
+---
+
+## 12 本文与参照文章的差异汇总
 
 | 维度 | 参照文章（etcd v3.1.10） | 本仓库 |
 |---|---|---|
@@ -764,7 +1200,7 @@ GroupClient.Prewrite        应用层：HTTP 客户端
 
 ---
 
-## 10 如何自行验证本文的说法
+## 13 如何自行验证本文的说法
 
 本文每一条结构性断言都能在源码中核对，且大部分有对应的测试：
 
@@ -777,5 +1213,28 @@ GroupClient.Prewrite        应用层：HTTP 客户端
 | 屏障按日志位置生效 | `txn/store.go` 的 `CmdBarrier`；测试 `TestReadBarrierEstablishesAppliedPrefix` |
 | 读者不得凭租约回滚 | `txn/client.go` 的 `ensurePrimaryResolved`/`abortAtPrimary`；测试 `TestSealedSecondaryIsNotLostWhenALeaseLapses` |
 | 跨组原子性 | 测试 `TestCommitTimestampsPairUpAcrossGroups` |
+| `IsLeader()` 自查只是优化 | §9 引用的 `Node.propose` 注释，以及 `Server.Apply` 内部对状态的复查 |
+| 读可见性与写冲突严格互补 | 对照 `txn/store.go` 的 `latestVersionAt`（`<`）与 `writeConflict`（`>=`）；测试 `TestStoreNoLostUpdateAtTheSnapshotBoundary` |
+| prewrite 先校验后落锁 | §10.1 引用的 `txn/store.go`：校验循环在落锁循环**之前** |
+| seal 不发布版本 | `txn/store.go` 的 `seal` 只写 `lock.CommitTS` 与 `actor.State`，不调用 `publishVersion` |
+| 失败出口的语义区分 | `txn/errors.go` 的 `LockRolledBackError` 与 `CommitUnknownError`，以及 `Txn.Commit` 里各自的返回点 |
+
+本文的**代码引用**与**图表**同样是被脚本校验的，而不是被信任的：
+
+```sh
+# 每个 ```go 块都必须逐字出现在源码中（除非它自带 -- simplified 标记，
+# 而且即使标了，它显示的每一行也必须真实存在）
+node tools/doc-check/verify-quoted-code.js docs/05-workflow-analysis.zh-CN.md .
+
+# 结构：代码块、mermaid 图、标题、链接、行内 code span
+node tools/doc-check/verify-translation.js docs/05-workflow-analysis.zh-CN.md docs/05-workflow-analysis.md
+
+# mermaid 文法
+node tools/doc-check/check-mermaid.js docs/05-workflow-analysis.zh-CN.md
+```
+
+这三个脚本各自发现过真实错误 —— 例如本文曾把 `raft.Storage.Set` 的取值类型写成 `any`
+（实际是 `[]byte`），也曾在 `commitChanSender` 的引用里把 `entries =` 写成 `entries :=`。
+两处都已修正。
 
 若本文与源码不一致，**以源码为准**，并请提一个 issue 或直接修正本文。

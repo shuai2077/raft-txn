@@ -173,12 +173,18 @@ their Chinese versions and a suggested reading order. The documents themselves:
   what each module talks to and through which interface, and the write and read flows
   decomposed into numbered steps naming the module, the call, and the data structure
   that crosses the boundary. Where `04` says which parts exist, this says how they
-  cooperate at run time.
+  cooperate at run time. Its last three sections are a code-level walkthrough of the
+  transaction mechanism and its interaction with the consensus layer: the six gates a
+  request passes, the three tables of the transaction state machine and the two rules
+  that must be exact complements, and the two handshakes (prewrite, and seal-then-commit)
+  with the failure-handling closure around them.
 
 Each of the five also has a Chinese translation, named after the original with a
 `.zh-CN.md` suffix. The translations are checked rather than trusted: a script
 verifies that code blocks, mermaid diagrams, headings, links and inline `code spans`
-all survived the translation intact.
+all survived the translation intact. A second script checks that every Go snippet
+quoted in a document actually appears in the sources — which has already caught two
+wrong quotations.
 
 ## Status and limits
 

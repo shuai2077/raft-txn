@@ -244,7 +244,7 @@ reader who meets an unclear structure in the flow sections later can come back h
 ### 4.1 LogEntry / CommitEntry
 
 ```go
-// internal/raft/raft.go
+// internal/raft/raft.go -- simplified
 type LogEntry struct {
     Command any
     Term    int
@@ -271,7 +271,7 @@ this repository has not changed it.
 ### 4.2 Server
 
 ```go
-// internal/raft/server.go
+// internal/raft/server.go -- simplified
 type Server struct {
     serverId    int
     peerIds     []int
@@ -304,7 +304,7 @@ hangs when several nodes stop at the same time.
 ### 4.3 ConsensusModule (the node state machine)
 
 ```go
-// internal/raft/raft.go
+// internal/raft/raft.go -- simplified
 type ConsensusModule struct {
     id        int
     peerIds   []int
@@ -359,7 +359,7 @@ that entry.
 ### 4.4 StateMachineHandler (the one outbound interface between layers)
 
 ```go
-// internal/raft/raft.go
+// internal/raft/raft.go -- simplified
 type StateMachineHandler interface {
     Apply(command any) any
 }
@@ -385,16 +385,22 @@ The carrier for the return value of a synchronous proposal. `value` is exactly w
 ### 4.6 Storage
 
 ```go
-// internal/raft/storage.go
+// internal/raft/storage.go -- simplified
 type Storage interface {
-    Set(key string, value any)
-    Get(key string) (any, bool)
+    Set(key string, value []byte)
+    Get(key string) ([]byte, bool)
+    HasData() bool
 }
 ```
 
-The persistence interface; `MapStorage` is the in-memory implementation. On every
-change, upstream's implementation gob-encodes and writes **the entire log**, which is
-quadratic in log length — a known simplification that is deliberately kept.
+The persistence interface; `MapStorage` is the in-memory implementation. Note that the
+value is `[]byte` rather than `any`: the state machine accepts arbitrary Go values, but
+the persistence layer takes bytes only, because the algorithm layer chooses its own
+encoding — `persistToStorage` uses `gob` to encode `currentTerm`, `votedFor` and **the
+entire log** separately and writes them under three keys.
+
+On every change, upstream's implementation gob-encodes and writes the entire log, which
+is quadratic in log length — a known simplification that is deliberately kept.
 
 ---
 
@@ -403,7 +409,7 @@ quadratic in log length — a known simplification that is deliberately kept.
 ### 5.1 txnservice.Node (the group service)
 
 ```go
-// txnservice/service.go
+// txnservice/service.go -- simplified
 type Node struct {
     cfg     NodeConfig
     groupID txn.GroupID
@@ -427,16 +433,16 @@ type Node struct {
 precisely a dependency chain:
 
 ```
-raft.NewServer(...) → Serve()          算法层起来
-txn.NewRaftLog(groupID, raftServer)    适配成 Log 接口
-txn.NewStore(log)                      数据状态机
-raftServer.SetHandler(store)           挂上状态机钩子
+raft.NewServer(...) → Serve()          algorithm layer is up
+txn.NewRaftLog(groupID, raftServer)    adapted into the Log interface
+txn.NewStore(log)                      the data state machine
+raftServer.SetHandler(store)           the state-machine hook is installed
 ```
 
 ### 5.2 txn.RaftLog (the cross-layer adapter)
 
 ```go
-// txn/raftadapter.go
+// txn/raftadapter.go -- simplified
 type RaftLog struct {
     server  *raft.Server
     groupID GroupID
@@ -461,7 +467,7 @@ interpretation of the result. This becomes very clear in the comparison table in
 ### 5.3 txn.Store (the data state machine)
 
 ```go
-// txn/store.go
+// txn/store.go -- simplified
 type Store struct {
     log       Log
     lockTTL   time.Duration
@@ -490,7 +496,7 @@ Each of the three maps answers a different question:
 ### 5.4 txn.Client and txn.Txn (the coordinator and the transaction handle)
 
 ```go
-// txn/client.go
+// txn/client.go -- simplified
 type Client struct {
     oracle       Oracle
     partitioner  Partitioner
@@ -525,7 +531,7 @@ once per transaction.
 ### 5.5 txn.TxnCommand (the command vocabulary of the cross-group protocol)
 
 ```go
-// txn/command.go
+// txn/command.go -- simplified
 type TxnCommand struct {
     Kind TxnCommandKind
     ReadArgs        *ReadArgs
@@ -584,7 +590,10 @@ index := cm.propose(cmd)                    // (1) append to the log and get the
 ch := make(chan proposalResult, 1)          // (2) build the result channel (buffered by 1)
 cm.results[index] = ch                      // (3) register the association: index → channel
 if cm.commitIndex >= index {                // (4) if already committed, nudge the applier once
-    select { case cm.newCommitReadyChan <- struct{}{}: default: }
+    select {
+    case cm.newCommitReadyChan <- struct{}{}:
+    default:
+    }
 }
 cm.mu.Unlock()                              // (5) release the lock, then wait
 select {
@@ -597,23 +606,40 @@ case <-timer.C:                             // (6c) timeout (no majority)
 Correspondingly, on the apply side in the algorithm layer:
 
 ```go
-// internal/raft/raft.go — commitChanSender
+// internal/raft/raft.go — commitChanSender (simplified; loop body only)
 for range cm.newCommitReadyChan {
     cm.mu.Lock()
-    entries := cm.log[cm.lastApplied+1 : cm.commitIndex+1]  // take the newly committed entries
+    entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]   // take the newly committed entries
     cm.lastApplied = cm.commitIndex
     handler := cm.handler
     cm.mu.Unlock()                                          // the key point: release the lock, then apply
 
     for i, entry := range entries {
-        result := handler.Apply(entry.Command)              // apply to the data state machine
+        var result any
+        if handler != nil {
+            result = handler.Apply(entry.Command)           // apply to the data state machine
+        }
+
         cm.mu.Lock()
         if ch, ok := cm.results[index]; ok {                // find the proposer
             delete(cm.results, index)
             cm.mu.Unlock()
-            select { case ch <- proposalResult{value: result}: default: }
-        } else { cm.mu.Unlock() }
-        select { case cm.commitChan <- CommitEntry{...}: case <-cm.stopChan: }
+            select {
+            case ch <- proposalResult{value: result, err: applyErr}:
+            default:
+            }
+        } else {
+            cm.mu.Unlock()
+        }
+        select {
+        case cm.commitChan <- CommitEntry{
+            Command: entry.Command,
+            Index:   index,
+            Term:    savedTerm,
+        }:
+        case <-cm.stopChan:
+            return
+        }
     }
 }
 ```
@@ -751,16 +777,16 @@ Step by step, the modules and data structures:
 algorithm layer is actually put to use:
 
 ```
-GroupClient.Prewrite        应用层：HTTP 客户端
-  → Node.handlePrewrite     应用层：HTTP 服务端，解码 JSON
-  → Node.propose            应用层：先做 leader 自查（省一次日志往返）
-  → RaftLog.ApplyCommand    适配层：包成 TxnCommand
-  → Server.Apply            算法层：propose + 等结果
-      → ConsensusModule.propose        追加日志 → 触发复制
-      → commitChanSender               日志被多数派复制后
-          → Store.Apply(TxnCommand)    数据状态机：写锁、查冲突
-      → cm.results[index] <- result    回传
-  → 渲染 WriteResponse → HTTP 响应
+GroupClient.Prewrite        application layer: HTTP client
+  → Node.handlePrewrite     application layer: HTTP server, decodes JSON
+  → Node.propose            application layer: leader self-check first (saves a log round trip)
+  → RaftLog.ApplyCommand    adapter layer: wraps it into a TxnCommand
+  → Server.Apply            algorithm layer: propose + wait for the result
+      → ConsensusModule.propose        append to the log → trigger replication
+      → commitChanSender               once the entry is majority-replicated
+          → Store.Apply(TxnCommand)    data state machine: install locks, check conflicts
+      → cm.results[index] <- result    hand the answer back
+  → render WriteResponse → HTTP response
 ```
 
 **Why step 7 is the commit point**: `Seal` only writes `commitTS` into the primary
@@ -838,7 +864,463 @@ Three patterns run through the whole document:
 
 ---
 
-## 9 Summary of differences from the reference article
+## 9 Key code analysis (1): the six gates a request passes before the consensus layer
+
+§3.2 mentions that `handle*` does not call `Store` directly. This section unpacks that
+sentence: for an HTTP request to actually enter the Raft log it must pass through six
+gates in turn, and **each gate has an explicit reason for rejecting it**.
+
+```go
+// txnservice/service.go
+func (n *Node) propose(w http.ResponseWriter, req *http.Request, cmd txn.TxnCommand,
+	render func(txn.TxnResult) any) {
+	if !n.IsLeader() {
+		// Avoid one wasted log round trip per request by answering with a routing
+		// hint, so the client goes straight to the leader. This is an
+		// optimization, not a consistency requirement: Apply would reject the
+		// command anyway.
+		writeJSON(w, notLeaderPayload(n.LeaderHint(), int(n.groupID)))
+		return
+	}
+
+	res, err := n.log.ApplyCommand(req.Context(), cmd)
+	if err != nil {
+		var notLeader *txn.NotLeaderError
+		if errors.As(err, &notLeader) {
+			writeJSON(w, notLeaderPayload(notLeader.LeaderID, int(notLeader.GroupID)))
+			return
+		}
+		writeJSON(w, internalErrorPayload(err))
+		return
+	}
+	writeJSON(w, render(res))
+}
+```
+
+There are three easily missed points in these twenty-odd lines:
+
+1. **The `IsLeader()` self-check is a pure optimisation.** The comment says it plainly:
+   even without the check, `Server.Apply` would reject a command from a non-leader (it
+   re-checks the state itself under the lock). This check only saves one log round trip
+   that is doomed anyway. **This matters**: it means the correctness of this fast path
+   does not depend on the quality of the `IsLeader()` implementation — it may return a
+   stale `true`, and in that case `ApplyCommand` returns `NotLeaderError` and takes the
+   branch below.
+2. **The two `not-leader` branches do not mean the same thing.** The upper one is
+   produced by `Node` itself (the command did not even enter the log); the lower one
+   comes from `RaftLog.ApplyCommand` translating `raft.NotLeaderError`. Both return a
+   leader hint, so the client need not tell them apart.
+3. **`render` is deferred.** The command is replicated and applied first, and only once
+   the `TxnResult` is in hand does `render` turn it into the concrete response structure
+   (`WriteResponse` or `LockedResponse`). The failure paths do not build a response body
+   at all.
+
+Next comes the sixth gate — `RaftLog.ApplyCommand`'s adaptation of `*raft.Server`:
+
+```go
+// txn/raftadapter.go
+func (rl *RaftLog) ApplyCommand(ctx context.Context, cmd TxnCommand) (TxnResult, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return TxnResult{}, ctx.Err()
+		default:
+		}
+	}
+
+	out, err := rl.server.Apply(cmd)
+	if err != nil {
+		var notLeader *raft.NotLeaderError
+		if errors.As(err, &notLeader) {
+			rl.learnLeader(notLeader.LeaderID)
+			return TxnResult{}, &NotLeaderError{GroupID: rl.groupID, LeaderID: notLeader.LeaderID}
+		}
+		return TxnResult{}, err
+	}
+
+	// A leader that lost leadership between the check and the apply returns nil:
+	// the command was not applied. Report it as a routing failure so the caller
+	// retries against the new leader.
+	if out == nil {
+		return TxnResult{}, &NotLeaderError{GroupID: rl.groupID, LeaderID: rl.LeaderHint()}
+	}
+
+	res, ok := out.(TxnResult)
+	if !ok {
+		return TxnResult{}, fmt.Errorf("txn: group %d: state machine returned %T, want TxnResult",
+			rl.groupID, out)
+	}
+	return res, nil
+}
+```
+
+This is **the complete content of the inter-layer adaptation**: one type assertion, one
+error translation, one boundary case handled. Three points are worth noting:
+
+- **`out == nil` is not an error but "leadership was just lost".** Upstream `Apply`
+  returns nil silently on some paths to say that the command was not applied. The
+  adapter does not treat it as an empty result; it translates it into `NotLeaderError`
+  so that the layer above retries — treated as success, the coordinator would carry on
+  on the strength of a write that **never happened**.
+- **`learnLeader` is a local cache of the hint.** When a `NotLeaderError` arrives it
+  notes the hinted leader id in passing, so the next `LeaderHint()` can answer
+  immediately without asking Raft again.
+- **A failed type assertion is reported explicitly.** If the state machine returns
+  something that is not a `TxnResult`, then some other module has installed itself as
+  the `StateMachineHandler` — that is a configuration error, and it has to fail loudly.
+
+---
+
+## 10 Key code analysis (2): the three tables of the transaction state machine
+
+All the data in `Store` is three maps (§5.3). Their **write timing** is completely
+different, and that is exactly what the transaction mechanism turns on:
+
+| Table | When it is written | When it is deleted | The question it answers |
+|---|---|---|---|
+| `versions map[Key][]Version` | `publishVersion`, i.e. **at commit** | never (no garbage collection) | what snapshot S can see |
+| `locks map[Key]*LockRecord` | `prewrite`, i.e. **at prepare** | `commit` / `rollback` | is there a write being held back |
+| `actors map[TxnID]*Actor` | `actorOrCreate`, created at prepare | never | has this transaction been decided |
+
+### 10.1 prewrite: settle both lock judgements first, then touch the state
+
+```go
+// txn/store.go
+	expiresAt := s.expiresAt()
+
+	// Validate every write before mutating anything, so the group is never left
+	// partially locked by a rejected request. (This mirrors the atomicity
+	// assumption internal/raft makes about its own storage: one log entry, one
+	// state transition.)
+	for _, op := range req.Ops {
+		if res, bad := s.checkPrewriteOp(req, op, expiresAt); bad {
+			return s.memoize(req.TxnID, req.ClientID, req.RequestID, res)
+		}
+	}
+
+	// Commit point: install the intent locks.
+	for _, op := range req.Ops {
+		s.locks[op.Key] = &LockRecord{
+			TxnID:     req.TxnID,
+			StartTS:   req.StartTS,
+			Primary:   req.Primary,
+			Kind:      op.Kind,
+			Value:     op.Value,
+			CommitTS:  0,
+			ExpiresAt: expiresAt,
+		}
+	}
+```
+
+**The separation into two steps is deliberate**: validate the whole batch of write
+operations first, then install all the locks at once. The comment ties this to the
+atomicity assumption `internal/raft` makes about its own storage — "one log entry, one
+state transition". If locks were installed while validating, a single rejected request
+would leave the group **partially locked**, and that state would be replicated to every
+replica.
+
+`CommitTS: 0` is the key: it means "the lock is in place, but the transaction is not yet
+decided". Only **sealing** (`seal`) writes a non-zero value there.
+
+### 10.2 The two decision rules must be exact complements
+
+`checkPrewriteOp` contains two judgements, and the relation between them is the core of
+the whole isolation model:
+
+```go
+// txn/store.go — latestVersionAt (simplified) // simplified
+func (s *Store) latestVersionAt(key Key, startTS Timestamp) (Version, bool) {
+	versions := s.versions[key]
+	best := -1
+	for i := range versions {
+		if versions[i].CommitTS < startTS {
+			best = i
+		} else {
+			break
+		}
+	}
+	// ...
+}
+```
+
+```go
+// txn/store.go — writeConflict (simplified)
+func (s *Store) writeConflict(key Key, startTS Timestamp) (Timestamp, Timestamp, bool) {
+	versions := s.versions[key]
+	if len(versions) == 0 {
+		return 0, 0, false
+	}
+	newest := versions[len(versions)-1]
+	if newest.CommitTS >= startTS {
+		// The newest version is not visible to our snapshot. Report the oldest
+		// such version, which is the one we are in conflict with.
+		for i := range versions {
+			if versions[i].CommitTS >= startTS {
+				return versions[i].StartTS, versions[i].CommitTS, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+```
+
+Reads use a strict `<`, conflicts use `>=`. **The two must be exact complements**, or a
+gap one timestamp wide opens up: some version is **invisible** to that snapshot and yet
+does not **block** the write — so the writer overwrites a commit it never saw.
+
+This is pinned down by an explicit comment in the code, and it is the subject of
+[`docs/02-transaction-design.md`](02-transaction-design.md) §7.4. Note that the inner
+loop in `writeConflict` takes the **oldest** conflicting version rather than the newest:
+what should be reported to the caller is "the one you ran into", which is what makes the
+error message diagnosable.
+
+### 10.3 seal: write only the decision, publish no data
+
+`seal` is the atomic commit point of the transaction, and it **publishes nothing**:
+
+```go
+// txn/store.go — seal (simplified; structure and key branches preserved)
+	lock.CommitTS = args.CommitTS
+	s.observeCommitTS(args.CommitTS)
+	// Sealing extends the lease: the transaction is now decided, and a reader
+	// should get a chance to see the decision before anybody force-resolves it.
+	lock.ExpiresAt = s.expiresAt()
+
+	actor := s.actorOrCreate(args.TxnID)
+	if actor.Primary == "" {
+		actor.Primary = lock.Primary
+	}
+	// Sealing records the transaction's decision. It is the commit point: the
+	// group now knows the transaction is committed even though the write is not
+	// published yet. The CmdCommit that follows (issued by the coordinator, or by
+	// any reader that discovers this decision) publishes it.
+	if !actor.State.Final() {
+		actor.State = StateCommitted
+	}
+	if actor.CommitTS == 0 {
+		actor.CommitTS = args.CommitTS
+	}
+```
+
+Three effects, each with a definite purpose:
+
+1. **`lock.CommitTS` becomes non-zero** → any reader that reads this lock learns
+   "committed" immediately, without having to ask the primary group.
+2. **`actor.State = StateCommitted`** → the primary group has recorded the decision
+   itself, so a reader of a secondary lock that comes asking gets an answer.
+3. **`lock.ExpiresAt` is extended** → a transaction that has just been decided should
+   get a chance to be read out, rather than being force-resolved immediately.
+
+One more gate stands in front of `seal` — **an already-aborted transaction cannot be
+sealed** (`StatusAlreadyAborted`). That gate and "a reader may discard a lock only after
+the abort decision has landed on disk" corroborate each other: both let **the order
+within one and the same Raft log** decide who wins, instead of guessing from timestamps
+or leases.
+
+### 10.4 commit: idempotent, and able to tell "just did it" from "done long ago"
+
+```go
+// txn/store.go — the tail of commit (simplified) // simplified
+		s.publishVersion(key, lock.StartTS, commitTS, lock.Kind, lock.Value)
+		delete(s.locks, key)
+		committed++
+		effectiveTS = commitTS
+	}
+	// ...
+	actor = s.actorOrCreate(req.TxnID)
+	actor.State = StateCommitted
+	if effectiveTS != 0 {
+		actor.CommitTS = effectiveTS
+	}
+
+	types := StatusOK
+	if actor != nil && actor.State == StateCommitted && committed == 0 {
+		// Nothing was published and the decision was already on record: this is a
+		// retry of a commit that has fully landed. Report it as such so callers
+		// can tell "already done" from "just did it".
+		types = StatusAlreadyCommitted
+	}
+```
+
+`publishVersion` and `delete(s.locks, key)` appear as a pair: **at the very moment a
+version is published, its lock disappears**. The two happen in the same log entry, so
+they are atomic for every replica.
+
+The distinction between `StatusAlreadyCommitted` and `StatusOK` is not just cosmetic: a
+`Commit` request may be re-sent on the network, and the coordinator needs to know whether
+"I really published this time" or "somebody already published it" — the former lets it
+close the books, the latter says that somebody is already helping to finish up.
+
+---
+
+## 11 Key code analysis (3): the two handshakes between the transaction and the consensus layer
+
+In the eight-step flow of §7.2, step 4 (prewrite) and step 7 (seal) are the two key
+points of interaction with the consensus layer. This section lays out one complete round
+trip for each of them.
+
+### 11.1 The first handshake: prewrite
+
+```
+coordinator                               a Raft group
+───────────                               ────────────
+Txn.prewrite
+ └ Client.prewriteWrites
+    │  primaryKeyOf(writes)               ← the primary key is computed locally, no coordination needed
+    │  byGroup splits the write set by the partitioner
+    └ Participant.Prewrite(req)
+       ├─(HTTP path) GroupClient.Prewrite
+       │   └ callFor → POST /txn/prewrite/
+       │                                  Node.handlePrewrite → propose
+       │                                   (1) IsLeader self-check
+       └─(in-process path) RaftLog.Prewrite
+                                        RaftLog.ApplyCommand
+                                         (2) server.Apply(cmd)
+                                          ├ cm.propose: append to the log + persist + trigger replication
+                                          ├ cm.results[index] = ch
+                                          └ wait on ch
+                                        commitChanSender (once the entry is replicated to a majority)
+                                         (3) handler.Apply(cmd)
+                                          └ Store.Apply → Store.prewrite
+                                              ├ checkPrewriteOp × len(Ops)
+                                              └ install the locks + actor.State = StatePrepared
+                                         (4) ch <- proposalResult{value: TxnResult}
+       ← WriteResponse{status, prepared}  (5) render(res) → JSON
+```
+
+**Every step has a different failure mode, and that is what is worth noting about this
+design**:
+
+| Step | On failure | Translated into what, and by whom |
+|---|---|---|
+| (1) | this node is not the leader | `Node` returns `not-leader` + a hint directly, and produces no log entry |
+| (2) | the re-check finds it is no longer the leader | `raft.NotLeaderError` → `txn.NotLeaderError` |
+| (2) | no majority | after `ApplyTimeout`, `abandonProposal`; reports "not committed within the time limit" |
+| (3) | a write conflict / a lock collision | returns a `TxnResult` **rather than an error**; a business verdict travels in the result, not in the error |
+| (4) | the proposer has already given up | the non-blocking delivery is dropped; the applier is unaffected |
+
+**The design stance of step (3) deserves emphasis on its own**: a write conflict and a
+lock conflict are both **normal results**, returned through `TxnResult.Status` rather
+than as a Go `error`. The line is drawn clearly —
+
+- `error` means **this RPC failed to obtain a verdict** (routing, timeout, shutdown),
+  and the caller should retry;
+- `TxnResult.Status` means **a verdict was obtained, and the verdict is no** (a conflict,
+  a lock held by someone else), and the caller should change its behaviour accordingly.
+
+Mix the two together and the coordinator can no longer tell "a retry may succeed" from "a
+retry is certain to fail". §11.3 shows how that distinction is used directly in the retry
+decision.
+
+### 11.2 The second handshake: seal and commit
+
+Sealing takes exactly the same path as prewrite, only with a different command:
+
+```
+Txn.commitPrimary(commitTS, prepared)
+ ├ participant.Seal(primaryKey, id, startTS, commitTS)
+ │   └ TxnCommand{Kind: CmdSeal, SealArgs: &SealArgs{...}}
+ │      └ …same as steps (2)~(4) of §11.1…
+ │         Store.seal: lock.CommitTS = commitTS
+ │                    actor.State  = StateCommitted   ← the transaction commits here
+ │                    lock.ExpiresAt extended
+ └ participant.Commit(CommitRequest{Keys: [primaryKey]})
+     └ TxnCommand{Kind: CmdCommit, ...}
+        Store.commit: publishVersion + delete(lock)   ← the primary-key write becomes visible
+```
+
+**Sealing and committing are two independent log entries, and the split is deliberate.**
+The two differ in cost and in consequence:
+
+- `seal` needs only one log entry and an $O(1)$ state change. It decides the fate of the
+  transaction. **Whether the transaction has committed when it fails depends on whether
+  it was accepted by a majority** — which is exactly why `CommitUnknownError` exists.
+- `commit` is what actually writes versions. It has to read the lock record and append to
+  the version chain in `CommitTS` order. **Its failure does not affect the fact that the
+  transaction has committed**, because any reader can complete it itself from the sealed
+  lock.
+
+So a failure of `commitPrimary` is translated into `CommitUnknownError` ("committed, but
+possibly not finished") rather than into an ordinary error:
+
+```go
+	// The atomic commit point.
+	if err := t.commitPrimary(ctx, commitTS, prepared); err != nil {
+		t.state = stateCommitted
+		t.committedTS = commitTS
+		return commitTS, &CommitUnknownError{TxnID: t.id, CommitTS: commitTS, Err: err}
+	}
+```
+
+Note that `t.state = stateCommitted` is set **before the error is returned**. That looks
+counter-intuitive, but it is right: once the seal has been proposed, the transaction can
+no longer be rolled back. `Txn.Finish`, or any reader, completes the secondary writes
+afterwards.
+
+### 11.3 The complete closure of failure handling
+
+Stringing the two handshakes above together, the closure of failure handling looks like
+this:
+
+```mermaid
+flowchart TB
+    A["Txn.Commit"] --> B["prewrite to each group"]
+    B -->|"failure"| C["abortLockedGroups<br/>abort the primary first, then release the secondary locks"]
+    B -->|"success"| D["oracle.CommitTS"]
+    D -->|"failure"| C
+    D -->|"success"| E["verifyLocksHeld"]
+    E -->|"lock already lost"| C
+    E -->|"lock still held"| F["Seal (the primary key)"]
+    F -->|"error"| G["CommitUnknownError<br/>t.state = committed"]
+    F -->|"success"| H["Commit the primary + each secondary key"]
+    H -->|"partial failure"| G
+    G --> I["Txn.Finish<br/>re-send with the recorded commitTS"]
+    C --> J["LockRolledBackError<br/>retryable"]
+    I -->|"success"| K["done"]
+    I -->|"failure"| L["reader resolution as the fallback"]
+```
+
+The meaning of the three exits:
+
+| Exit | The transaction's final state | What the caller should do |
+|---|---|---|
+| ordinary success | committed, every write visible | carry on |
+| `LockRolledBackError` | **not committed**, no write published | retry the whole transaction (a new transaction, new timestamps) |
+| `CommitUnknownError` | **committed**, possibly with writes not published | call `Txn.Finish` to complete it; **never retry the whole transaction** |
+
+**The last row is the easiest place in this design to get wrong.** Once a transaction has
+been sealed, retrying it amounts to letting the same batch of writes be applied twice —
+and its write set may be "add 1 to the balance". The job of `Txn.Finish` and of reader
+resolution is precisely to turn "committed but not finished" into a state that is
+**terminating**, rather than one the caller has to guess about.
+
+The position of `verifyLocksHeld` is equally key: it sits **after the commit timestamp is
+taken and before the seal**:
+
+```go
+// txn/client.go — the lock check in Txn.Commit (simplified; some comment lines elided)
+// Every lock must still be in place before the commit point is written.
+// ...
+// Sealing later cannot repair that, so the check has to happen first. If any
+// lock is gone, no commit point has been written and no version published, so
+// the transaction is still entirely invisible and aborting is safe.
+if err := t.verifyLocksHeld(ctx, prepared); err != nil {
+    _ = t.abortLockedGroups(ctx)
+    t.state = stateAborted
+    return 0, err
+}
+```
+
+The reasoning in the comment is worth reading sentence by sentence: **the check has to
+happen before the seal, because sealing afterwards cannot repair a write that has already
+been dropped**; and aborting when the check fails is **safe**, because no commit point has
+been written and no version published — the transaction is still entirely invisible.
+Together those two sentences are the complete statement of the precondition for fixing
+the lost-write race in [`docs/03-read-barrier.md`](03-read-barrier.md) §2.
+
+---
+
+## 12 Summary of differences from the reference article
 
 | Dimension | The reference article (etcd v3.1.10) | This repository |
 |---|---|---|
@@ -863,7 +1345,7 @@ channel to catch the leftovers.
 
 ---
 
-## 10 How to verify the claims in this document yourself
+## 13 How to verify the claims in this document yourself
 
 Every structural claim in this document can be checked against the source, and most
 have a corresponding test:
@@ -877,6 +1359,30 @@ have a corresponding test:
 | The barrier takes effect by log position | `CmdBarrier` in `txn/store.go`; the test `TestReadBarrierEstablishesAppliedPrefix` |
 | A reader must not roll back on the strength of a lease | `ensurePrimaryResolved`/`abortAtPrimary` in `txn/client.go`; the test `TestSealedSecondaryIsNotLostWhenALeaseLapses` |
 | Cross-group atomicity | the test `TestCommitTimestampsPairUpAcrossGroups` |
+| The `IsLeader()` self-check is only an optimisation | the `Node.propose` comment quoted in §9, and the state re-check inside `Server.Apply` |
+| Read visibility and write conflict are exact complements | compare `latestVersionAt` (`<`) and `writeConflict` (`>=`) in `txn/store.go`; the test `TestStoreNoLostUpdateAtTheSnapshotBoundary` |
+| prewrite validates before it installs locks | the `txn/store.go` excerpt in §10.1: the validation loop comes **before** the locking loop |
+| seal publishes no version | `seal` in `txn/store.go` writes only `lock.CommitTS` and `actor.State`; it does not call `publishVersion` |
+| The failure exits mean different things | `LockRolledBackError` and `CommitUnknownError` in `txn/errors.go`, and the points in `Txn.Commit` where each is returned |
+
+This document's **code quotations** and **diagrams** are likewise checked by scripts
+rather than trusted:
+
+```sh
+# every ```go block must appear verbatim in the sources (unless it carries its own
+# -- simplified marker, and even then every line it shows must really exist)
+node tools/doc-check/verify-quoted-code.js docs/05-workflow-analysis.md .
+
+# structure: code blocks, mermaid diagrams, headings, links, inline code spans
+node tools/doc-check/verify-translation.js docs/05-workflow-analysis.md docs/05-workflow-analysis.zh-CN.md
+
+# mermaid grammar
+node tools/doc-check/check-mermaid.js docs/05-workflow-analysis.md
+```
+
+Each of these three scripts has found real errors — for example this document once gave
+the value type of `raft.Storage.Set` as `any` (it is `[]byte`), and one quotation from
+`commitChanSender` wrote `entries :=` where the source has `entries =`. Both are fixed.
 
 If this document and the source disagree, **the source wins**; please open an issue or
 fix this document directly.
